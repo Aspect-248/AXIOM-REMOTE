@@ -47,3 +47,8 @@ any chat ID other than the one in `.env` are silently ignored.
 - `status`
 
 Add more by adding an entry to the `COMMANDS` dict in `bot.py`.
+
+Each command also accepts alternate phrasings (see the `ALIASES` dict
+in `bot.py` — e.g. "shut down", "turn off", and "power off" all trigger
+`shutdown`) and tolerates small typos via fuzzy matching, so you don't
+need to type a command exactly right for it to run.

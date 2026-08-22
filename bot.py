@@ -1,5 +1,7 @@
+import difflib
 import logging
 import os
+import re
 import subprocess
 import tempfile
 
@@ -146,6 +148,72 @@ COMMANDS = {
     "status": status,
 }
 
+# Alternate phrasings that resolve to a command above. Still a fixed,
+# known set of actions -- just more ways to say them. Add more here.
+ALIASES = {
+    "chrome": "open chrome",
+    "browser": "open chrome",
+    "open browser": "open chrome",
+    "notepad": "open notepad",
+    "explorer": "open explorer",
+    "files": "open explorer",
+    "open files": "open explorer",
+    "downloads": "open downloads",
+    "desktop": "open desktop",
+    "vscode": "open vscode",
+    "vs code": "open vscode",
+    "code": "open vscode",
+    "lock pc": "lock",
+    "lock laptop": "lock",
+    "shut down": "shutdown",
+    "turn off": "shutdown",
+    "power off": "shutdown",
+    "reboot": "restart",
+    "cancel": "cancel shutdown",
+    "abort shutdown": "cancel shutdown",
+    "sleep pc": "sleep",
+    "suspend": "sleep",
+    "mute volume": "mute",
+    "unmute volume": "unmute",
+    "vol up": "volume up",
+    "louder": "volume up",
+    "vol down": "volume down",
+    "quieter": "volume down",
+    "screen shot": "screenshot",
+    "take screenshot": "screenshot",
+    "ss": "screenshot",
+    "ping": "status",
+    "are you there": "status",
+}
+
+# Below this similarity ratio (0-1), a typo is treated as "unknown"
+# rather than guessed at.
+FUZZY_MATCH_CUTOFF = 0.75
+
+
+def _normalize(text: str) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    return re.sub(r"\s+", " ", text)
+
+
+def _resolve_command(text: str):
+    """Return (canonical_command, matched_phrase) or (None, None)."""
+    if text in COMMANDS:
+        return text, text
+    if text in ALIASES:
+        alias_target = ALIASES[text]
+        return alias_target, text
+
+    known_phrases = list(COMMANDS) + list(ALIASES)
+    close = difflib.get_close_matches(text, known_phrases, n=1, cutoff=FUZZY_MATCH_CUTOFF)
+    if not close:
+        return None, None
+
+    matched_phrase = close[0]
+    canonical = matched_phrase if matched_phrase in COMMANDS else ALIASES[matched_phrase]
+    return canonical, matched_phrase
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
@@ -154,21 +222,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
         return
 
-    text = (update.message.text or "").strip().lower()
-    handler = COMMANDS.get(text)
+    text = _normalize(update.message.text or "")
+    canonical, matched_phrase = _resolve_command(text)
+    handler = COMMANDS.get(canonical) if canonical else None
 
     if handler is None:
         available = ", ".join(sorted(COMMANDS))
         await update.message.reply_text(f"Unknown command. Available: {available}")
         return
 
-    log.info("Executing command: %s", text)
+    log.info("Executing command: %s (matched: %s)", canonical, matched_phrase)
     try:
         result = handler()
     except Exception as e:
-        log.exception("Command failed: %s", text)
+        log.exception("Command failed: %s", canonical)
         await update.message.reply_text(f"Command failed: {e}")
         return
+
+    if text != canonical and isinstance(result, str):
+        result = f"({canonical}) {result}"
 
     if isinstance(result, dict) and "photo" in result:
         with open(result["photo"], "rb") as f:
