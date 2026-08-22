@@ -34,7 +34,16 @@ any chat ID other than the one in `.env` are silently ignored.
 
 - `open chrome`
 - `open notepad`
+- `open explorer`
+- `open downloads`
+- `open desktop`
+- `open vscode`
 - `lock`
+- `shutdown` / `restart` — 60s delay, cancel with `cancel shutdown`
+- `sleep`
+- `mute` / `unmute`
+- `volume up` / `volume down`
+- `screenshot` — replies with a photo of the current screen
 - `status`
 
 Add more by adding an entry to the `COMMANDS` dict in `bot.py`.
