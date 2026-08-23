@@ -407,19 +407,26 @@ def _resolve_command(text: str):
 
 
 async def _handle_get_file(update: Update, filename: str):
-    log.info("Fetching file: %s", filename)
-    path = find_file(filename)
-    if path is None:
-        folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
-        await update.message.reply_text(f"No file matching '{filename}' found in {folders}.")
-        return
+    # Forgive "get <filename>" typed with the literal angle brackets
+    # from the README's placeholder notation.
+    filename = filename.strip().strip("<>").strip()
 
+    log.info("Fetching file: %s", filename)
     try:
+        path = find_file(filename)
+        if path is None:
+            folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
+            await update.message.reply_text(f"No file matching '{filename}' found in {folders}.")
+            return
+
         with open(path, "rb") as f:
             await update.message.reply_document(f, filename=os.path.basename(path))
     except Exception as e:
-        log.exception("Failed to send file: %s", path)
-        await update.message.reply_text(f"Failed to send file: {e}")
+        log.exception("get-file command failed: %s", filename)
+        try:
+            await update.message.reply_text(f"Command failed: {e}")
+        except Exception:
+            log.exception("Also failed to send the error reply for: %s", filename)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
