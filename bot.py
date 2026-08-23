@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 import winsound
@@ -185,14 +186,69 @@ def media_prev():
 
 
 def _get_rough_location() -> str:
+    """IP-based fallback -- city-level at best, can be badly wrong if
+    the ISP routes traffic through a distant hub."""
     try:
         with urllib.request.urlopen("http://ip-api.com/json/", timeout=5) as resp:
             data = json.loads(resp.read())
         if data.get("status") == "success":
             return f"Approx. location (IP-based, not GPS): {data['city']}, {data['regionName']}, {data['country']}"
     except Exception:
-        log.exception("Location lookup failed")
+        log.exception("IP-based location lookup failed")
     return "Location lookup failed."
+
+
+def _get_geoposition():
+    """Windows Location Services (WiFi-positioning) -- accurate to
+    tens/hundreds of meters, unlike IP geolocation. Runs the WinRT
+    async call on its own thread with its own event loop, since this
+    is invoked from inside the bot's already-running event loop."""
+    from winsdk.windows.devices.geolocation import Geolocator, PositionAccuracy
+
+    result = {}
+
+    def runner():
+        async def fetch():
+            geolocator = Geolocator()
+            geolocator.desired_accuracy = PositionAccuracy.HIGH
+            pos = await geolocator.get_geoposition_async()
+            point = pos.coordinate.point.position
+            return point.latitude, point.longitude, pos.coordinate.accuracy
+
+        result["value"] = asyncio.run(fetch())
+
+    thread = threading.Thread(target=runner)
+    thread.start()
+    thread.join(timeout=15)
+    if "value" not in result:
+        raise TimeoutError("Location request timed out.")
+    return result["value"]
+
+
+def _reverse_geocode(lat, lon):
+    url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json"
+    req = urllib.request.Request(url, headers={"User-Agent": "axiom-remote-telegram-bot"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    return data.get("display_name")
+
+
+def _get_location_text() -> str:
+    try:
+        lat, lon, accuracy = _get_geoposition()
+    except Exception:
+        log.exception("Precise location failed, falling back to IP-based estimate")
+        return _get_rough_location()
+
+    maps_link = f"https://maps.google.com/?q={lat},{lon}"
+    try:
+        address = _reverse_geocode(lat, lon)
+    except Exception:
+        log.exception("Reverse geocoding failed")
+        address = None
+
+    place = address or f"{lat:.5f}, {lon:.5f}"
+    return f"Location (~{int(accuracy)}m accuracy): {place}\n{maps_link}"
 
 
 def find_laptop():
@@ -205,7 +261,7 @@ def find_laptop():
         winsound.Beep(1000, 400)
         time.sleep(0.15)
 
-    location = _get_rough_location()
+    location = _get_location_text()
     shot = screenshot()
     return {"photo": shot["photo"], "caption": f"Beeped for you. {location}"}
 

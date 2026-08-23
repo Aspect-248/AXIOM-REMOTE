@@ -6,3 +6,4 @@ Pillow
 psutil
 opencv-python-headless
 faster-whisper
+winsdk
