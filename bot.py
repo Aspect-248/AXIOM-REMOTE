@@ -1,12 +1,15 @@
 import asyncio
 import ctypes
 import difflib
+import json
 import logging
 import os
 import re
 import subprocess
 import tempfile
 import time
+import urllib.request
+import winsound
 from datetime import timedelta
 
 import psutil
@@ -181,6 +184,32 @@ def media_prev():
     return "Previous track."
 
 
+def _get_rough_location() -> str:
+    try:
+        with urllib.request.urlopen("http://ip-api.com/json/", timeout=5) as resp:
+            data = json.loads(resp.read())
+        if data.get("status") == "success":
+            return f"Approx. location (IP-based, not GPS): {data['city']}, {data['regionName']}, {data['country']}"
+    except Exception:
+        log.exception("Location lookup failed")
+    return "Location lookup failed."
+
+
+def find_laptop():
+    # Make sure it can actually be heard even if it was muted/quiet.
+    vol = _volume_interface()
+    vol.SetMute(0, None)
+    vol.SetMasterVolumeLevelScalar(1.0, None)
+
+    for _ in range(6):
+        winsound.Beep(1000, 400)
+        time.sleep(0.15)
+
+    location = _get_rough_location()
+    shot = screenshot()
+    return {"photo": shot["photo"], "caption": f"Beeped for you. {location}"}
+
+
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
@@ -313,6 +342,7 @@ COMMANDS = {
     "volume down": volume_down,
     "screenshot": screenshot,
     "webcam": webcam,
+    "find": find_laptop,
     "status": status,
     "stats": stats,
     "play pause": media_play_pause,
@@ -370,6 +400,10 @@ ALIASES = {
     "camera": "webcam",
     "take photo": "webcam",
     "selfie": "webcam",
+    "find laptop": "find",
+    "find my laptop": "find",
+    "locate": "find",
+    "where are you": "find",
     "play": "play pause",
     "pause": "play pause",
     "next": "next track",
@@ -476,7 +510,7 @@ async def _execute_text_command(update: Update, raw_text: str):
 
     if isinstance(result, dict) and "photo" in result:
         with open(result["photo"], "rb") as f:
-            await update.message.reply_photo(f)
+            await update.message.reply_photo(f, caption=result.get("caption"))
     else:
         await update.message.reply_text(result)
 

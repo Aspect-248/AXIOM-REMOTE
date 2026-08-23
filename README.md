@@ -51,6 +51,8 @@ any chat ID other than the one in `.env` are silently ignored.
   document
 - `play pause` / `next track` / `previous track` — media keys
 - `webcam` — takes a photo with the webcam and sends it back
+- `find` — beeps loudly (also unmutes/maxes volume first), and sends
+  back a screenshot plus a rough IP-based location
 - `say <text>` — speaks the text out loud via Windows TTS
 - `type <text>` — copies the text to the clipboard and pastes it into
   whatever window currently has focus on the laptop (note: this
