@@ -15,7 +15,7 @@ from datetime import timedelta
 
 import psutil
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 load_dotenv()
@@ -262,8 +262,14 @@ def find_laptop():
         time.sleep(0.15)
 
     location = _get_location_text()
-    shot = screenshot()
-    return {"photo": shot["photo"], "caption": f"Beeped for you. {location}"}
+
+    photos = [screenshot()["photo"]]
+    try:
+        photos.append(webcam()["photo"])
+    except Exception:
+        log.exception("find: webcam capture failed, sending screenshot only")
+
+    return {"photos": photos, "caption": f"Beeped for you. {location}"}
 
 
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -564,7 +570,18 @@ async def _execute_text_command(update: Update, raw_text: str):
     if text != canonical and isinstance(result, str):
         result = f"({canonical}) {result}"
 
-    if isinstance(result, dict) and "photo" in result:
+    if isinstance(result, dict) and "photos" in result:
+        files = [open(p, "rb") for p in result["photos"]]
+        try:
+            media = [
+                InputMediaPhoto(f, caption=result.get("caption") if i == 0 else None)
+                for i, f in enumerate(files)
+            ]
+            await update.message.reply_media_group(media)
+        finally:
+            for f in files:
+                f.close()
+    elif isinstance(result, dict) and "photo" in result:
         with open(result["photo"], "rb") as f:
             await update.message.reply_photo(f, caption=result.get("caption"))
     else:
