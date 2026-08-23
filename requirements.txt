@@ -1,5 +1,6 @@
-python-telegram-bot>=21,<22
+python-telegram-bot[job-queue]>=21,<22
 python-dotenv
 pycaw
 comtypes
 Pillow
+psutil

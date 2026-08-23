@@ -1,10 +1,14 @@
+import ctypes
 import difflib
 import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
+from datetime import timedelta
 
+import psutil
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -125,6 +129,55 @@ def status():
     return "AXIOM laptop is on and listening."
 
 
+def stats():
+    cpu = psutil.cpu_percent(interval=0.5)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("C:\\")
+    uptime = timedelta(seconds=int(time.time() - psutil.boot_time()))
+
+    lines = [
+        f"CPU: {cpu}%",
+        f"RAM: {mem.percent}% ({mem.used // (1024**3)}GB / {mem.total // (1024**3)}GB)",
+        f"Disk (C:): {disk.percent}% used",
+        f"Uptime: {uptime}",
+    ]
+    battery = psutil.sensors_battery()
+    if battery:
+        plug_state = "plugged in" if battery.power_plugged else "on battery"
+        lines.append(f"Battery: {battery.percent}% ({plug_state})")
+    return "\n".join(lines)
+
+
+# Files can only be fetched from these folders, by exact or partial
+# filename match -- not an arbitrary path-read.
+SEARCH_FOLDERS = [
+    os.path.expanduser("~\\Desktop"),
+    os.path.expanduser("~\\Downloads"),
+    os.path.expanduser("~\\Documents"),
+]
+
+
+def find_file(filename: str):
+    filename = filename.strip()
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        return None
+
+    target = filename.lower()
+    matches = []
+    for folder in SEARCH_FOLDERS:
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            full_path = os.path.join(folder, name)
+            if os.path.isfile(full_path) and target in name.lower():
+                matches.append(full_path)
+
+    exact = [m for m in matches if os.path.basename(m).lower() == target]
+    if exact:
+        return exact[0]
+    return matches[0] if matches else None
+
+
 # Allowlist: only these exact phrases (case-insensitive) do anything.
 # Deliberately NOT a generic "run whatever text you send" handler --
 # this bot has real access to the machine, so the set of things it can
@@ -147,6 +200,7 @@ COMMANDS = {
     "volume down": volume_down,
     "screenshot": screenshot,
     "status": status,
+    "stats": stats,
 }
 
 # Alternate phrasings that resolve to a command above. Still a fixed,
@@ -185,6 +239,9 @@ ALIASES = {
     "ss": "screenshot",
     "ping": "status",
     "are you there": "status",
+    "sysinfo": "stats",
+    "system stats": "stats",
+    "system info": "stats",
 }
 
 # Below this similarity ratio (0-1), a typo is treated as "unknown"
@@ -216,6 +273,22 @@ def _resolve_command(text: str):
     return canonical, matched_phrase
 
 
+async def _handle_get_file(update: Update, filename: str):
+    log.info("Fetching file: %s", filename)
+    path = find_file(filename)
+    if path is None:
+        folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
+        await update.message.reply_text(f"No file matching '{filename}' found in {folders}.")
+        return
+
+    try:
+        with open(path, "rb") as f:
+            await update.message.reply_document(f, filename=os.path.basename(path))
+    except Exception as e:
+        log.exception("Failed to send file: %s", path)
+        await update.message.reply_text(f"Failed to send file: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
 
@@ -223,7 +296,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
         return
 
-    text = _normalize(update.message.text or "")
+    raw_text = (update.message.text or "").strip()
+
+    get_match = re.match(r"(?i)^get\s+(.+)$", raw_text)
+    if get_match:
+        await _handle_get_file(update, get_match.group(1))
+        return
+
+    text = _normalize(raw_text)
     canonical, matched_phrase = _resolve_command(text)
     handler = COMMANDS.get(canonical) if canonical else None
 
@@ -250,6 +330,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(result)
 
 
+class _LastInputInfo(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+def get_idle_seconds() -> float:
+    info = _LastInputInfo()
+    info.cbSize = ctypes.sizeof(_LastInputInfo)
+    ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info))
+    millis_idle = ctypes.windll.kernel32.GetTickCount() - info.dwTime
+    return millis_idle / 1000.0
+
+
+# Proactive alert thresholds. Each has a low/high pair so an alert
+# fires once when crossing into the bad range, then stays quiet until
+# things clearly recover (hysteresis) instead of repeating every check.
+BATTERY_LOW_PERCENT = 15
+BATTERY_RECOVERED_PERCENT = 25
+DISK_FULL_PERCENT = 90
+DISK_RECOVERED_PERCENT = 80
+IDLE_ALERT_SECONDS = 2 * 60 * 60  # 2 hours
+ALERT_CHECK_INTERVAL_SECONDS = 5 * 60
+
+_alert_state = {"battery_low": False, "disk_full": False, "idle": False}
+
+
+async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
+    battery = psutil.sensors_battery()
+    if battery is not None:
+        if (
+            battery.percent <= BATTERY_LOW_PERCENT
+            and not battery.power_plugged
+            and not _alert_state["battery_low"]
+        ):
+            _alert_state["battery_low"] = True
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=f"Battery low: {battery.percent}%. Plug in the laptop.",
+            )
+        elif battery.power_plugged or battery.percent >= BATTERY_RECOVERED_PERCENT:
+            _alert_state["battery_low"] = False
+
+    disk_percent = psutil.disk_usage("C:\\").percent
+    if disk_percent >= DISK_FULL_PERCENT and not _alert_state["disk_full"]:
+        _alert_state["disk_full"] = True
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"Disk (C:) is {disk_percent}% full.",
+        )
+    elif disk_percent < DISK_RECOVERED_PERCENT:
+        _alert_state["disk_full"] = False
+
+    idle_seconds = get_idle_seconds()
+    if idle_seconds >= IDLE_ALERT_SECONDS and not _alert_state["idle"]:
+        _alert_state["idle"] = True
+        idle_display = timedelta(seconds=int(idle_seconds))
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"Laptop has been idle for {idle_display}.",
+        )
+    elif idle_seconds < 60:
+        _alert_state["idle"] = False
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
@@ -258,6 +401,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.job_queue.run_repeating(check_alerts, interval=ALERT_CHECK_INTERVAL_SECONDS, first=60)
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)
     app.run_polling()
