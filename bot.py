@@ -17,6 +17,7 @@ ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID")
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
+    filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log"),
 )
 log = logging.getLogger("telegram-remote")
 
