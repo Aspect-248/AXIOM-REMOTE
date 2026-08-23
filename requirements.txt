@@ -4,3 +4,4 @@ pycaw
 comtypes
 Pillow
 psutil
+opencv-python-headless

@@ -125,6 +125,118 @@ def screenshot():
     return {"photo": path}
 
 
+def webcam():
+    import cv2
+
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open the webcam.")
+
+    try:
+        # Discard the first few frames -- most webcams need a moment to
+        # adjust exposure/focus, and the very first frame is often dark.
+        for _ in range(5):
+            cap.read()
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+
+    if not ok:
+        raise RuntimeError("Failed to capture a frame from the webcam.")
+
+    path = os.path.join(tempfile.gettempdir(), "axiom_webcam.jpg")
+    cv2.imwrite(path, frame)
+    return {"photo": path}
+
+
+_MEDIA_KEYEVENTF_EXTENDEDKEY = 0x1
+_MEDIA_KEYEVENTF_KEYUP = 0x2
+_VK_MEDIA_NEXT_TRACK = 0xB0
+_VK_MEDIA_PREV_TRACK = 0xB1
+_VK_MEDIA_PLAY_PAUSE = 0xB3
+
+
+def _send_media_key(vk_code):
+    ctypes.windll.user32.keybd_event(vk_code, 0, _MEDIA_KEYEVENTF_EXTENDEDKEY, 0)
+    ctypes.windll.user32.keybd_event(
+        vk_code, 0, _MEDIA_KEYEVENTF_EXTENDEDKEY | _MEDIA_KEYEVENTF_KEYUP, 0
+    )
+
+
+def media_play_pause():
+    _send_media_key(_VK_MEDIA_PLAY_PAUSE)
+    return "Play/pause."
+
+
+def media_next():
+    _send_media_key(_VK_MEDIA_NEXT_TRACK)
+    return "Next track."
+
+
+def media_prev():
+    _send_media_key(_VK_MEDIA_PREV_TRACK)
+    return "Previous track."
+
+
+POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+
+
+def say(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "Nothing to say."
+
+    # Text is piped in via stdin rather than interpolated into the
+    # -Command string, so arbitrary Telegram input can't break out into
+    # extra PowerShell commands.
+    script = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        "$synth.Speak([Console]::In.ReadToEnd())"
+    )
+    proc = subprocess.Popen(
+        [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Command", script],
+        stdin=subprocess.PIPE,
+    )
+    proc.stdin.write(text.encode("utf-8"))
+    proc.stdin.close()
+    return f"Saying: {text}"
+
+
+def type_text(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return "Nothing to type."
+
+    # Same stdin-piping approach as say() to avoid command injection.
+    # Note: this overwrites your current clipboard content.
+    subprocess.run(
+        [
+            POWERSHELL_EXE,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+        ],
+        input=text,
+        text=True,
+        timeout=10,
+    )
+    time.sleep(0.2)
+
+    VK_CONTROL = 0x11
+    VK_V = 0x56
+    KEYEVENTF_KEYUP = 0x2
+    ctypes.windll.user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    ctypes.windll.user32.keybd_event(VK_V, 0, 0, 0)
+    time.sleep(0.05)
+    ctypes.windll.user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+    ctypes.windll.user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+    return f"Typed: {text}"
+
+
 def status():
     return "AXIOM laptop is on and listening."
 
@@ -199,8 +311,20 @@ COMMANDS = {
     "volume up": volume_up,
     "volume down": volume_down,
     "screenshot": screenshot,
+    "webcam": webcam,
     "status": status,
     "stats": stats,
+    "play pause": media_play_pause,
+    "next track": media_next,
+    "previous track": media_prev,
+}
+
+# Prefix commands: "<verb> <free text argument>". Still bounded --
+# each verb maps to exactly one function that only does what its name
+# says with that text (speak it / type it), not a general command runner.
+PREFIX_COMMANDS = {
+    "say": say,
+    "type": type_text,
 }
 
 # Alternate phrasings that resolve to a command above. Still a fixed,
@@ -242,6 +366,15 @@ ALIASES = {
     "sysinfo": "stats",
     "system stats": "stats",
     "system info": "stats",
+    "camera": "webcam",
+    "take photo": "webcam",
+    "selfie": "webcam",
+    "play": "play pause",
+    "pause": "play pause",
+    "next": "next track",
+    "skip": "next track",
+    "prev": "previous track",
+    "previous": "previous track",
 }
 
 # Below this similarity ratio (0-1), a typo is treated as "unknown"
@@ -303,6 +436,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_get_file(update, get_match.group(1))
         return
 
+    prefix_match = re.match(r"(?i)^(say|type)\s+(.+)$", raw_text)
+    if prefix_match:
+        verb = prefix_match.group(1).lower()
+        arg = prefix_match.group(2)
+        log.info("Executing command: %s %s", verb, arg)
+        try:
+            result = PREFIX_COMMANDS[verb](arg)
+        except Exception as e:
+            log.exception("Command failed: %s", verb)
+            await update.message.reply_text(f"Command failed: {e}")
+            return
+        await update.message.reply_text(result)
+        return
+
     text = _normalize(raw_text)
     canonical, matched_phrase = _resolve_command(text)
     handler = COMMANDS.get(canonical) if canonical else None
@@ -328,6 +475,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_photo(f)
     else:
         await update.message.reply_text(result)
+
+
+# Where files sent to the bot get saved.
+INCOMING_FILES_FOLDER = os.path.expanduser("~\\Downloads\\FromTelegram")
+
+
+def _unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{base} ({i}){ext}"):
+        i += 1
+    return f"{base} ({i}){ext}"
+
+
+async def handle_incoming_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        log.warning("Ignored file from unauthorized chat_id=%s", chat_id)
+        return
+
+    if update.message.document:
+        tg_file = update.message.document
+        filename = tg_file.file_name or f"file_{tg_file.file_unique_id}"
+    elif update.message.photo:
+        tg_file = update.message.photo[-1]
+        filename = f"photo_{tg_file.file_unique_id}.jpg"
+    else:
+        return
+
+    os.makedirs(INCOMING_FILES_FOLDER, exist_ok=True)
+    dest = _unique_path(os.path.join(INCOMING_FILES_FOLDER, filename))
+
+    try:
+        tg_file_obj = await context.bot.get_file(tg_file.file_id)
+        await tg_file_obj.download_to_drive(dest)
+    except Exception as e:
+        log.exception("Failed to save incoming file")
+        await update.message.reply_text(f"Failed to save file: {e}")
+        return
+
+    log.info("Saved incoming file: %s", dest)
+    await update.message.reply_text(f"Saved to {dest}")
 
 
 class _LastInputInfo(ctypes.Structure):
@@ -401,6 +592,7 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_incoming_file))
     app.job_queue.run_repeating(check_alerts, interval=ALERT_CHECK_INTERVAL_SECONDS, first=60)
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)

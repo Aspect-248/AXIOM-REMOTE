@@ -49,6 +49,15 @@ any chat ID other than the one in `.env` are silently ignored.
 - `get <filename>` — searches Desktop/Downloads/Documents for a
   matching file (exact or partial name) and sends it back as a
   document
+- `play pause` / `next track` / `previous track` — media keys
+- `webcam` — takes a photo with the webcam and sends it back
+- `say <text>` — speaks the text out loud via Windows TTS
+- `type <text>` — copies the text to the clipboard and pastes it into
+  whatever window currently has focus on the laptop (note: this
+  overwrites your current clipboard contents)
+
+Send a file or photo directly to the bot (no command needed) and it
+saves it to `~\Downloads\FromTelegram` on the laptop.
 
 Add more by adding an entry to the `COMMANDS` dict in `bot.py`.
 
