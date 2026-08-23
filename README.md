@@ -59,6 +59,15 @@ any chat ID other than the one in `.env` are silently ignored.
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
 
+## Voice commands
+
+Send a Telegram voice message instead of typing and the bot
+transcribes it locally (via `faster-whisper`, no cloud/API key
+involved) and runs whatever command it heard, same as if you'd typed
+it. It replies with what it heard first so you can tell if the
+transcription was off. First voice message after a fresh start takes
+a couple seconds longer while the model loads into memory.
+
 Add more by adding an entry to the `COMMANDS` dict in `bot.py`.
 
 Each command also accepts alternate phrasings (see the `ALIASES` dict

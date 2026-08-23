@@ -1,3 +1,4 @@
+import asyncio
 import ctypes
 import difflib
 import logging
@@ -429,14 +430,10 @@ async def _handle_get_file(update: Update, filename: str):
             log.exception("Also failed to send the error reply for: %s", filename)
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-
-    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
-        log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
-        return
-
-    raw_text = (update.message.text or "").strip()
+async def _execute_text_command(update: Update, raw_text: str):
+    """Resolve and run a command from plain text -- shared by the typed
+    message path and the voice-transcription path."""
+    raw_text = raw_text.strip()
 
     get_match = re.match(r"(?i)^get\s+(.+)$", raw_text)
     if get_match:
@@ -482,6 +479,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_photo(f)
     else:
         await update.message.reply_text(result)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
+        return
+
+    await _execute_text_command(update, update.message.text or "")
+
+
+# Loaded lazily on first voice message so bot startup isn't slowed down
+# by loading the model. ~2s from local cache after the one-time download.
+_whisper_model = None
+
+
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+
+        log.info("Loading Whisper model (first use)...")
+        _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def _transcribe(path: str) -> str:
+    model = _get_whisper_model()
+    segments, _info = model.transcribe(path)
+    return " ".join(seg.text.strip() for seg in segments).strip()
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+
+    if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
+        log.warning("Ignored voice message from unauthorized chat_id=%s", chat_id)
+        return
+
+    voice = update.message.voice
+    ogg_path = os.path.join(tempfile.gettempdir(), f"axiom_voice_{voice.file_unique_id}.ogg")
+
+    try:
+        tg_file = await context.bot.get_file(voice.file_id)
+        await tg_file.download_to_drive(ogg_path)
+        text = await asyncio.to_thread(_transcribe, ogg_path)
+    except Exception as e:
+        log.exception("Voice transcription failed")
+        await update.message.reply_text(f"Couldn't transcribe that: {e}")
+        return
+    finally:
+        if os.path.exists(ogg_path):
+            os.remove(ogg_path)
+
+    if not text:
+        await update.message.reply_text("Couldn't make out any words in that.")
+        return
+
+    log.info("Transcribed voice message: %s", text)
+    await update.message.reply_text(f'Heard: "{text}"')
+    await _execute_text_command(update, text)
 
 
 # Where files sent to the bot get saved.
@@ -600,6 +659,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_incoming_file))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.job_queue.run_repeating(check_alerts, interval=ALERT_CHECK_INTERVAL_SECONDS, first=60)
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)
