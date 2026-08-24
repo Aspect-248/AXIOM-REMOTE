@@ -163,6 +163,22 @@ SCREEN_RECORD_DURATION_SECONDS = 8
 SCREEN_RECORD_FPS = 8
 
 
+def _draw_cursor_marker(img):
+    """PIL's ImageGrab never includes the hardware mouse cursor (a
+    GDI BitBlt capture limitation) -- draw a visible marker at its
+    actual position instead so cursor movement shows up in recordings."""
+    from PIL import ImageDraw
+
+    point = wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+    draw = ImageDraw.Draw(img)
+    r = 10
+    draw.ellipse(
+        [point.x - r, point.y - r, point.x + r, point.y + r], outline="red", width=3
+    )
+    return img
+
+
 def screen_record():
     from PIL import ImageGrab
     import cv2
@@ -179,7 +195,7 @@ def screen_record():
         end_time = time.time() + SCREEN_RECORD_DURATION_SECONDS
         while time.time() < end_time:
             frame_start = time.time()
-            img = ImageGrab.grab()
+            img = _draw_cursor_marker(ImageGrab.grab())
             writer.write(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
             sleep_time = frame_interval - (time.time() - frame_start)
             if sleep_time > 0:
@@ -711,6 +727,15 @@ async def _execute_text_command(update: Update, raw_text: str):
         return
 
     log.info("Executing command: %s (matched: %s)", canonical, matched_phrase)
+
+    if canonical == "record":
+        # Recording blocks for several seconds -- tell the user right
+        # away so they know exactly when to start doing whatever they
+        # want captured, rather than guessing at the timing.
+        await update.message.reply_text(
+            f"Recording for {SCREEN_RECORD_DURATION_SECONDS}s starting now..."
+        )
+
     try:
         result = handler()
     except Exception as e:
