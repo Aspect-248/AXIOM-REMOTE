@@ -1178,9 +1178,8 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
     _seen_notification_ids.intersection_update(current_ids)
 
 
-# Every check briefly lights up the webcam LED -- kept infrequent
-# (not e.g. every 15s like notifications) so it's not constantly on.
-INTRUDER_CHECK_INTERVAL_SECONDS = 3 * 60
+# Every check briefly lights up the webcam LED.
+INTRUDER_CHECK_INTERVAL_SECONDS = 60
 
 _intruder_alerted = False
 
