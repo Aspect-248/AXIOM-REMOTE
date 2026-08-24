@@ -769,33 +769,31 @@ NOTIFICATION_WORKER_SCRIPT = os.path.join(
 )
 
 
-def _poll_notifications():
-    """Read current Windows toast notifications by running
-    notification_worker.py as a short-lived subprocess.
+def _run_notification_worker(*args, timeout=20):
+    """Run notification_worker.py as a short-lived subprocess and
+    return its parsed JSON output, or None on any failure.
 
     This is deliberately NOT done in-process (even on a background
-    thread): a malformed notification was observed to trigger a
-    native crash (segfault) deep in the WinRT bindings, which would
-    take the whole bot process down with it. Running it as a
-    subprocess means that crash just fails this one poll cycle.
-
-    Returns None on any failure (access denied, crash, timeout, bad
-    output), otherwise a list of [id, app_name, text_lines] for every
-    notification currently in the Action Center (not just new ones --
-    filtering happens by the caller against _seen_notification_ids)."""
+    thread): reading a notification's text was found to reliably
+    segfault -- a native crash deep in the WinRT bindings that no
+    Python try/except can catch, and it happens on genuine system
+    notifications, not just edge cases. Running each step as its own
+    subprocess means a crash there fails only that step, never the
+    bot itself."""
     try:
         proc = subprocess.run(
-            [sys.executable, NOTIFICATION_WORKER_SCRIPT],
+            [sys.executable, NOTIFICATION_WORKER_SCRIPT, *args],
             capture_output=True,
-            timeout=20,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        log.warning("Notification poll timed out")
+        log.warning("Notification worker timed out: %s", args)
         return None
 
     if proc.returncode != 0:
         log.warning(
-            "Notification poll worker exited with code %s: %s",
+            "Notification worker %s exited with code %s: %s",
+            args,
             proc.returncode,
             proc.stderr.decode(errors="replace")[-500:],
         )
@@ -804,18 +802,21 @@ def _poll_notifications():
     try:
         return json.loads(proc.stdout.decode())
     except Exception:
-        log.exception("Failed to parse notification worker output")
+        log.exception("Failed to parse notification worker output for %s", args)
         return None
 
 
 async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
     global _notifications_baseline_done
 
-    items = await asyncio.to_thread(_poll_notifications)
+    # Phase 1: list notification ids + app names. This alone has
+    # proven safe -- it's the per-notification text fetch that can
+    # crash, so that's isolated separately below, per notification.
+    items = await asyncio.to_thread(_run_notification_worker, "list")
     if items is None:
         return
 
-    current_ids = {notif_id for notif_id, _, _ in items}
+    current_ids = {notif_id for notif_id, _ in items}
 
     if not _notifications_baseline_done:
         # Don't dump everything already sitting in the Action Center
@@ -824,18 +825,26 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
         _notifications_baseline_done = True
         return
 
-    for notif_id, app_name, texts in items:
+    for notif_id, app_name in items:
         if notif_id in _seen_notification_ids:
             continue
         _seen_notification_ids.add(notif_id)
-        if not texts:
-            continue
 
-        title = texts[0]
-        body = " ".join(texts[1:])
-        message = f"[{app_name}] {title}"
-        if body:
-            message += f"\n{body}"
+        texts = await asyncio.to_thread(
+            _run_notification_worker, "text", str(notif_id)
+        )
+        if not texts:
+            # Either the text-fetch crashed/failed, or the notification
+            # genuinely has no text. Still tell the user something
+            # arrived rather than silently dropping it.
+            message = f"[{app_name}] New notification (couldn't read details)"
+        else:
+            title = texts[0]
+            body = " ".join(texts[1:])
+            message = f"[{app_name}] {title}"
+            if body:
+                message += f"\n{body}"
+
         await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=message)
 
     # Bound memory -- drop tracked IDs for notifications no longer present.
