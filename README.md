@@ -92,3 +92,21 @@ The bot also messages you unprompted (no command needed) when:
 Each alert fires once per threshold crossing, then stays quiet until
 things clearly recover, so it won't spam you. Checked every 5 minutes.
 Thresholds live at the top of `check_alerts()` in `bot.py`.
+
+## Notification mirror
+
+Windows toast notifications (email, chat apps, etc.) get forwarded to
+Telegram automatically, no command needed. Checked every 15 seconds
+via Windows' notification-listener API (requires "Notifications" to
+be turned on in Windows Settings > System). Only *new* notifications
+are sent -- whatever's already in the Action Center when the bot
+starts is used as a baseline, not dumped as a flood of messages.
+
+This reads notifications via `notification_worker.py`, run as a
+**separate subprocess** rather than in-process. That's deliberate: a
+malformed notification was found to trigger a native crash (segfault)
+deep in the underlying `winsdk` library when reading its text, and no
+amount of Python `try/except` can catch that -- it's a hard native
+crash. Isolating it in its own short-lived subprocess means a crash
+there just fails that one 15-second poll (logged as a warning) instead
+of taking the whole bot down.

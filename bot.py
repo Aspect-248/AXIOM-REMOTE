@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -757,6 +758,90 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
         _alert_state["idle"] = False
 
 
+NOTIFICATION_CHECK_INTERVAL_SECONDS = 15
+
+_seen_notification_ids = set()
+_notifications_baseline_done = False
+
+
+NOTIFICATION_WORKER_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "notification_worker.py"
+)
+
+
+def _poll_notifications():
+    """Read current Windows toast notifications by running
+    notification_worker.py as a short-lived subprocess.
+
+    This is deliberately NOT done in-process (even on a background
+    thread): a malformed notification was observed to trigger a
+    native crash (segfault) deep in the WinRT bindings, which would
+    take the whole bot process down with it. Running it as a
+    subprocess means that crash just fails this one poll cycle.
+
+    Returns None on any failure (access denied, crash, timeout, bad
+    output), otherwise a list of [id, app_name, text_lines] for every
+    notification currently in the Action Center (not just new ones --
+    filtering happens by the caller against _seen_notification_ids)."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, NOTIFICATION_WORKER_SCRIPT],
+            capture_output=True,
+            timeout=20,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Notification poll timed out")
+        return None
+
+    if proc.returncode != 0:
+        log.warning(
+            "Notification poll worker exited with code %s: %s",
+            proc.returncode,
+            proc.stderr.decode(errors="replace")[-500:],
+        )
+        return None
+
+    try:
+        return json.loads(proc.stdout.decode())
+    except Exception:
+        log.exception("Failed to parse notification worker output")
+        return None
+
+
+async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
+    global _notifications_baseline_done
+
+    items = await asyncio.to_thread(_poll_notifications)
+    if items is None:
+        return
+
+    current_ids = {notif_id for notif_id, _, _ in items}
+
+    if not _notifications_baseline_done:
+        # Don't dump everything already sitting in the Action Center
+        # from before the bot started -- just record it as seen.
+        _seen_notification_ids.update(current_ids)
+        _notifications_baseline_done = True
+        return
+
+    for notif_id, app_name, texts in items:
+        if notif_id in _seen_notification_ids:
+            continue
+        _seen_notification_ids.add(notif_id)
+        if not texts:
+            continue
+
+        title = texts[0]
+        body = " ".join(texts[1:])
+        message = f"[{app_name}] {title}"
+        if body:
+            message += f"\n{body}"
+        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=message)
+
+    # Bound memory -- drop tracked IDs for notifications no longer present.
+    _seen_notification_ids.intersection_update(current_ids)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
@@ -768,6 +853,9 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_incoming_file))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.job_queue.run_repeating(check_alerts, interval=ALERT_CHECK_INTERVAL_SECONDS, first=60)
+    app.job_queue.run_repeating(
+        check_notifications, interval=NOTIFICATION_CHECK_INTERVAL_SECONDS, first=10
+    )
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)
     app.run_polling()
