@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 *.log
+# Personal biometric data generated locally by "register face" --
+# specific to whoever set it up, never belongs in version control.
+models/owner_face.npy

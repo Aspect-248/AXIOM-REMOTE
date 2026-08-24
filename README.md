@@ -68,6 +68,10 @@ any chat ID other than the one in `.env` are silently ignored.
   something silly out loud, and opens a fresh Notepad window with a
   silly message typed into it (never touches any other already-open
   Notepad window)
+- `register face` — captures a webcam frame and registers it as
+  "you" for face recognition (one person only; re-run to replace)
+- `check camera` — on-demand check: is the person in view you, a
+  stranger, or nobody?
 
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
@@ -116,3 +120,24 @@ amount of Python `try/except` can catch that -- it's a hard native
 crash. Isolating it in its own short-lived subprocess means a crash
 there just fails that one 15-second poll (logged as a warning) instead
 of taking the whole bot down.
+
+## Face recognition / intruder alert
+
+Setup: send `register face` once, facing the webcam. After that, the
+bot checks the webcam every 3 minutes and messages you unprompted
+with a photo if it sees a face that isn't you. No command needed once
+registered; `check camera` runs the same check on demand for testing.
+
+Heads up: this means the webcam LED will blink briefly every check,
+even though nothing was asked of it -- that's the visible tradeoff of
+proactive (vs. on-demand) monitoring. Only recognizes one person
+("you" vs. "not you") -- re-running `register face` replaces the
+previous registration rather than adding a second person.
+
+Uses OpenCV's built-in YuNet (detection) + SFace (recognition) DNN
+models rather than the `dlib`-based `face_recognition` package, which
+needs a C++ compiler toolchain to install on Windows and often fails.
+Model files live in `models/` (downloaded from the official
+`opencv/opencv_zoo` repo, checksum-verified); your registered face
+(`models/owner_face.npy`) is generated locally and gitignored -- it's
+personal biometric data, never committed.

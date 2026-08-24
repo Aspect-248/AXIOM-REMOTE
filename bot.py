@@ -133,7 +133,8 @@ def screenshot():
     return {"photo": path}
 
 
-def webcam():
+def _capture_webcam_frame():
+    """Capture a single frame from the webcam as a BGR numpy array."""
     import cv2
 
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
@@ -153,10 +154,125 @@ def webcam():
 
     if not ok:
         raise RuntimeError("Failed to capture a frame from the webcam.")
+    return frame
 
+
+def webcam():
+    import cv2
+
+    frame = _capture_webcam_frame()
     path = os.path.join(tempfile.gettempdir(), "axiom_webcam.jpg")
     cv2.imwrite(path, frame)
     return {"photo": path}
+
+
+# --- Face recognition ---
+#
+# Uses OpenCV's built-in YuNet (detection) + SFace (recognition) DNN
+# models instead of the dlib-based `face_recognition` package, which
+# is notoriously painful to install on Windows (needs a C++ compiler
+# toolchain). Model files live in ./models/, downloaded once from the
+# official opencv/opencv_zoo repo, checksum-verified against the
+# repo's Git LFS pointer.
+FACE_MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+FACE_DETECTOR_MODEL = os.path.join(FACE_MODELS_DIR, "face_detection_yunet_2023mar.onnx")
+FACE_RECOGNIZER_MODEL = os.path.join(FACE_MODELS_DIR, "face_recognition_sface_2021dec.onnx")
+OWNER_FACE_PATH = os.path.join(FACE_MODELS_DIR, "owner_face.npy")
+
+FACE_DETECT_SCORE_THRESHOLD = 0.6
+# OpenCV's recommended cosine-similarity threshold for "same person"
+# with SFace -- below this, treat as a different/unrecognized face.
+FACE_MATCH_THRESHOLD = 0.363
+
+_face_detector = None
+_face_recognizer = None
+
+
+def _get_face_models():
+    global _face_detector, _face_recognizer
+    import cv2
+
+    if _face_detector is None:
+        _face_detector = cv2.FaceDetectorYN_create(
+            FACE_DETECTOR_MODEL, "", (320, 320), score_threshold=FACE_DETECT_SCORE_THRESHOLD
+        )
+    if _face_recognizer is None:
+        _face_recognizer = cv2.FaceRecognizerSF_create(FACE_RECOGNIZER_MODEL, "")
+    return _face_detector, _face_recognizer
+
+
+def _detect_faces(frame):
+    detector, _ = _get_face_models()
+    h, w = frame.shape[:2]
+    detector.setInputSize((w, h))
+    ok, faces = detector.detect(frame)
+    return faces if faces is not None else []
+
+
+def _face_embedding(frame, face_box):
+    _, recognizer = _get_face_models()
+    aligned = recognizer.alignCrop(frame, face_box)
+    return recognizer.feature(aligned)
+
+
+def register_face():
+    import numpy as np
+
+    frame = _capture_webcam_frame()
+    faces = _detect_faces(frame)
+
+    if len(faces) == 0:
+        return "No face detected. Try again facing the camera with better lighting."
+    if len(faces) > 1:
+        return f"Detected {len(faces)} faces -- make sure only you are in frame when registering."
+
+    embedding = _face_embedding(frame, faces[0])
+    os.makedirs(FACE_MODELS_DIR, exist_ok=True)
+    np.save(OWNER_FACE_PATH, embedding)
+    return "Face registered. I'll now watch for unrecognized faces."
+
+
+def _check_faces_sync():
+    """Capture a frame and compare any detected face(s) against the
+    registered owner. Returns (is_stranger, photo_path_or_None)."""
+    import cv2
+    import numpy as np
+
+    frame = _capture_webcam_frame()
+    faces = _detect_faces(frame)
+    if len(faces) == 0:
+        return False, None
+
+    owner_embedding = np.load(OWNER_FACE_PATH)
+    _, recognizer = _get_face_models()
+
+    stranger_found = False
+    for face in faces:
+        embedding = _face_embedding(frame, face)
+        score = recognizer.match(owner_embedding, embedding, cv2.FaceRecognizerSF_FR_COSINE)
+        if score < FACE_MATCH_THRESHOLD:
+            stranger_found = True
+
+    if not stranger_found:
+        return False, None
+
+    path = os.path.join(tempfile.gettempdir(), "axiom_face_check.jpg")
+    cv2.imwrite(path, frame)
+    return True, path
+
+
+def check_camera_now():
+    """On-demand version of the proactive check, for testing without
+    waiting for the periodic job."""
+    if not os.path.exists(OWNER_FACE_PATH):
+        return "No face registered yet. Send 'register face' first."
+
+    is_stranger, photo_path = _check_faces_sync()
+    if photo_path is None:
+        return "No face currently in view." if not is_stranger else "Unclear result."
+    if is_stranger:
+        return {"photo": photo_path, "caption": "Unrecognized face."}
+    return "That's you -- recognized."
 
 
 SCREEN_RECORD_DURATION_SECONDS = 8
@@ -588,6 +704,8 @@ COMMANDS = {
     "volume down": volume_down,
     "screenshot": screenshot,
     "webcam": webcam,
+    "register face": register_face,
+    "check camera": check_camera_now,
     "record": screen_record,
     "find": find_laptop,
     "prank": prank_mode,
@@ -647,6 +765,12 @@ ALIASES = {
     "system info": "stats",
     "camera": "webcam",
     "take photo": "webcam",
+    "remember me": "register face",
+    "remember my face": "register face",
+    "register my face": "register face",
+    "learn my face": "register face",
+    "who is there": "check camera",
+    "whos there": "check camera",
     "selfie": "webcam",
     "screen record": "record",
     "clip": "record",
@@ -1054,6 +1178,35 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
     _seen_notification_ids.intersection_update(current_ids)
 
 
+# Every check briefly lights up the webcam LED -- kept infrequent
+# (not e.g. every 15s like notifications) so it's not constantly on.
+INTRUDER_CHECK_INTERVAL_SECONDS = 3 * 60
+
+_intruder_alerted = False
+
+
+async def check_intruder(context: ContextTypes.DEFAULT_TYPE):
+    global _intruder_alerted
+
+    if not os.path.exists(OWNER_FACE_PATH):
+        return  # nobody registered yet, nothing to compare against
+
+    try:
+        is_stranger, photo_path = await asyncio.to_thread(_check_faces_sync)
+    except Exception:
+        log.exception("Intruder check failed")
+        return
+
+    if is_stranger and not _intruder_alerted:
+        _intruder_alerted = True
+        with open(photo_path, "rb") as f:
+            await context.bot.send_photo(
+                chat_id=ALLOWED_CHAT_ID, photo=f, caption="Unrecognized face detected."
+            )
+    elif not is_stranger:
+        _intruder_alerted = False
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
@@ -1067,6 +1220,9 @@ def main():
     app.job_queue.run_repeating(check_alerts, interval=ALERT_CHECK_INTERVAL_SECONDS, first=60)
     app.job_queue.run_repeating(
         check_notifications, interval=NOTIFICATION_CHECK_INTERVAL_SECONDS, first=10
+    )
+    app.job_queue.run_repeating(
+        check_intruder, interval=INTRUDER_CHECK_INTERVAL_SECONDS, first=30
     )
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)
