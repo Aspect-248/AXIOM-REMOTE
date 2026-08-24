@@ -6,5 +6,6 @@ Pillow
 psutil
 opencv-python-headless
 numpy
+imageio-ffmpeg
 faster-whisper
 winsdk

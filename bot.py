@@ -180,14 +180,37 @@ def _draw_cursor_marker(img):
 
 
 def screen_record():
-    from PIL import ImageGrab
-    import cv2
+    # OpenCV's bundled FFmpeg can DECODE H.264 but not ENCODE it (no
+    # licensed encoder DLL), so cv2.VideoWriter falls back to old
+    # MPEG-4 Part 2 ("FMP4") -- poorly supported by modern players,
+    # which is why recordings looked frozen in Telegram's preview
+    # despite the raw capture itself working. Piping frames into
+    # imageio-ffmpeg's bundled ffmpeg (built with libx264) instead
+    # gives a properly compatible H.264 file.
+    import imageio_ffmpeg
     import numpy as np
+    from PIL import ImageGrab
 
     width, height = ImageGrab.grab().size
     path = os.path.join(tempfile.gettempdir(), "axiom_recording.mp4")
-    writer = cv2.VideoWriter(
-        path, cv2.VideoWriter_fourcc(*"mp4v"), SCREEN_RECORD_FPS, (width, height)
+
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(),
+        "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(SCREEN_RECORD_FPS),
+        "-i", "-",
+        "-an",
+        "-vcodec", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "ultrafast",
+        path,
+    ]
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
     try:
@@ -196,12 +219,14 @@ def screen_record():
         while time.time() < end_time:
             frame_start = time.time()
             img = _draw_cursor_marker(ImageGrab.grab())
-            writer.write(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+            frame_bgr = np.array(img)[:, :, ::-1]  # RGB -> BGR
+            proc.stdin.write(frame_bgr.tobytes())
             sleep_time = frame_interval - (time.time() - frame_start)
             if sleep_time > 0:
                 time.sleep(sleep_time)
     finally:
-        writer.release()
+        proc.stdin.close()
+        proc.wait(timeout=15)
 
     return {"video": path}
 
