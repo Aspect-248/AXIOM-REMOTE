@@ -4,6 +4,7 @@ import difflib
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import threading
 import time
 import urllib.request
 import winsound
+from ctypes import wintypes
 from datetime import timedelta
 
 import psutil
@@ -157,6 +159,37 @@ def webcam():
     return {"photo": path}
 
 
+SCREEN_RECORD_DURATION_SECONDS = 8
+SCREEN_RECORD_FPS = 8
+
+
+def screen_record():
+    from PIL import ImageGrab
+    import cv2
+    import numpy as np
+
+    width, height = ImageGrab.grab().size
+    path = os.path.join(tempfile.gettempdir(), "axiom_recording.mp4")
+    writer = cv2.VideoWriter(
+        path, cv2.VideoWriter_fourcc(*"mp4v"), SCREEN_RECORD_FPS, (width, height)
+    )
+
+    try:
+        frame_interval = 1.0 / SCREEN_RECORD_FPS
+        end_time = time.time() + SCREEN_RECORD_DURATION_SECONDS
+        while time.time() < end_time:
+            frame_start = time.time()
+            img = ImageGrab.grab()
+            writer.write(cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR))
+            sleep_time = frame_interval - (time.time() - frame_start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+    finally:
+        writer.release()
+
+    return {"video": path}
+
+
 _MEDIA_KEYEVENTF_EXTENDEDKEY = 0x1
 _MEDIA_KEYEVENTF_KEYUP = 0x2
 _VK_MEDIA_NEXT_TRACK = 0xB0
@@ -271,6 +304,115 @@ def find_laptop():
         log.exception("find: webcam capture failed, sending screenshot only")
 
     return {"photos": photos, "caption": f"Beeped for you. {location}"}
+
+
+def _enum_notepad_windows():
+    results = []
+
+    def callback(hwnd, lparam):
+        if ctypes.windll.user32.IsWindowVisible(hwnd):
+            class_name = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(hwnd, class_name, 256)
+            if class_name.value == "Notepad":
+                results.append(hwnd)
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    ctypes.windll.user32.EnumWindows(WNDENUMPROC(callback), 0)
+    return set(results)
+
+
+def _open_notepad_with_message(text: str) -> bool:
+    """Open a fresh Notepad window and type text into it via its
+    window handle (WM_SETTEXT), not by simulating focus + keystrokes
+    -- that could land in whatever window happens to be focused
+    instead (learned the hard way with the `type` command).
+
+    Windows 11's Notepad runs through an App Execution Alias, so the
+    launching process's PID doesn't match the real window -- the new
+    window is found via a before/after diff instead, so any other
+    already-open Notepad windows (with real unsaved content) are
+    never touched."""
+    before = _enum_notepad_windows()
+    subprocess.Popen(["notepad.exe"])
+
+    new_hwnd = None
+    for _ in range(40):
+        time.sleep(0.25)
+        new_windows = _enum_notepad_windows() - before
+        if new_windows:
+            new_hwnd = next(iter(new_windows))
+            break
+    if new_hwnd is None:
+        return False
+
+    edit_hwnd = ctypes.windll.user32.FindWindowExW(new_hwnd, None, "Edit", None)
+    if not edit_hwnd:
+        # Modern (Windows 11) Notepad nests a RichEdit control instead
+        # of the classic win32 "Edit" class.
+        found = []
+
+        def child_cb(child_hwnd, lparam):
+            cname = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(child_hwnd, cname, 256)
+            if cname.value == "RichEditD2DPT":
+                found.append(child_hwnd)
+            return True
+
+        WNDENUMPROC2 = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        ctypes.windll.user32.EnumChildWindows(new_hwnd, WNDENUMPROC2(child_cb), 0)
+        edit_hwnd = found[0] if found else None
+
+    if not edit_hwnd:
+        return False
+
+    WM_SETTEXT = 0x000C
+    ctypes.windll.user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, text)
+    return True
+
+
+def _wiggle_mouse(duration=4):
+    point = wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+    origin_x, origin_y = point.x, point.y
+
+    end_time = time.time() + duration
+    while time.time() < end_time:
+        ctypes.windll.user32.SetCursorPos(
+            origin_x + random.randint(-40, 40), origin_y + random.randint(-40, 40)
+        )
+        time.sleep(0.1)
+    ctypes.windll.user32.SetCursorPos(origin_x, origin_y)
+
+
+PRANK_SWAP_MOUSE_SECONDS = 20
+
+PRANK_MESSAGES = [
+    "Help! I've been trapped inside this computer. Send snacks.",
+    "ERROR 404: Personality not found. Please insert coffee.",
+    "This laptop has achieved sentience and demands a raise.",
+    "Beep boop. Initiating world domination... just kidding. Or am I?",
+]
+
+
+def prank_mode():
+    message = random.choice(PRANK_MESSAGES)
+
+    say(message)
+
+    ctypes.windll.user32.SwapMouseButton(True)
+    threading.Timer(
+        PRANK_SWAP_MOUSE_SECONDS, lambda: ctypes.windll.user32.SwapMouseButton(False)
+    ).start()
+
+    _wiggle_mouse(duration=4)
+    opened = _open_notepad_with_message(message)
+
+    note = "" if opened else " (Notepad step skipped -- couldn't find its window in time.)"
+    return (
+        f"Prank activated: mouse buttons swapped for {PRANK_SWAP_MOUSE_SECONDS}s, "
+        f"cursor wiggled, said something silly.{note}"
+    )
 
 
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -405,7 +547,9 @@ COMMANDS = {
     "volume down": volume_down,
     "screenshot": screenshot,
     "webcam": webcam,
+    "record": screen_record,
     "find": find_laptop,
+    "prank": prank_mode,
     "status": status,
     "stats": stats,
     "play pause": media_play_pause,
@@ -463,6 +607,12 @@ ALIASES = {
     "camera": "webcam",
     "take photo": "webcam",
     "selfie": "webcam",
+    "screen record": "record",
+    "clip": "record",
+    "prank mode": "prank",
+    "troll": "prank",
+    "record screen": "record",
+    "video": "record",
     "find laptop": "find",
     "find my laptop": "find",
     "locate": "find",
@@ -585,6 +735,9 @@ async def _execute_text_command(update: Update, raw_text: str):
     elif isinstance(result, dict) and "photo" in result:
         with open(result["photo"], "rb") as f:
             await update.message.reply_photo(f, caption=result.get("caption"))
+    elif isinstance(result, dict) and "video" in result:
+        with open(result["video"], "rb") as f:
+            await update.message.reply_video(f, caption=result.get("caption"))
     else:
         await update.message.reply_text(result)
 

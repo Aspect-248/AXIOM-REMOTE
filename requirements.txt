@@ -5,5 +5,6 @@ comtypes
 Pillow
 psutil
 opencv-python-headless
+numpy
 faster-whisper
 winsdk

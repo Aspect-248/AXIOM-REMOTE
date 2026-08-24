@@ -62,6 +62,12 @@ any chat ID other than the one in `.env` are silently ignored.
 - `type <text>` — copies the text to the clipboard and pastes it into
   whatever window currently has focus on the laptop (note: this
   overwrites your current clipboard contents)
+- `record` — records an 8-second screen capture and sends it back as
+  a video
+- `prank` — swaps the mouse buttons for 20s, wiggles the cursor, says
+  something silly out loud, and opens a fresh Notepad window with a
+  silly message typed into it (never touches any other already-open
+  Notepad window)
 
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
