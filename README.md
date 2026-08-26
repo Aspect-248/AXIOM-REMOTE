@@ -134,6 +134,16 @@ proactive (vs. on-demand) monitoring. Only recognizes one person
 ("you" vs. "not you") -- re-running `register face` replaces the
 previous registration rather than adding a second person.
 
+Every webcam capture (this feature, `webcam`, `find`) runs through
+`webcam_worker.py` as a subprocess with a hard 15s timeout, not
+in-process. `cv2.VideoCapture.read()` was found to hang indefinitely
+on a flaky driver in practice -- the webcam LED stayed on for hours
+with no exception raised, because a hung call never reaches its own
+`finally: cap.release()`. A blocking hang like that can't be
+interrupted from Python; the subprocess gets hard-killed on timeout
+instead, which forces the OS to release the camera regardless of how
+stuck the driver is.
+
 Uses OpenCV's built-in YuNet (detection) + SFace (recognition) DNN
 models rather than the `dlib`-based `face_recognition` package, which
 needs a C++ compiler toolchain to install on Windows and often fails.

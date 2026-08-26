@@ -133,27 +133,47 @@ def screenshot():
     return {"photo": path}
 
 
+WEBCAM_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webcam_worker.py")
+WEBCAM_CAPTURE_TIMEOUT_SECONDS = 15
+
+
 def _capture_webcam_frame():
-    """Capture a single frame from the webcam as a BGR numpy array."""
+    """Capture a single frame from the webcam as a BGR numpy array,
+    via an isolated subprocess with a hard timeout.
+
+    This is NOT done in-process: cv2.VideoCapture.read() can hang
+    indefinitely on a flaky driver -- observed directly, with the
+    webcam LED staying on for hours because a hung call never reaches
+    its own `finally: cap.release()`. A blocking C-level hang can't be
+    interrupted from Python. Running it in a subprocess means a hang
+    can only ever cost WEBCAM_CAPTURE_TIMEOUT_SECONDS -- subprocess.run
+    kills the process on timeout, which forces the OS to release the
+    camera handle no matter how stuck the driver is."""
     import cv2
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open the webcam.")
+    out_path = os.path.join(tempfile.gettempdir(), "axiom_webcam_capture.jpg")
+    if os.path.exists(out_path):
+        os.remove(out_path)
 
     try:
-        # Discard the first few frames -- most webcams need a moment to
-        # adjust exposure/focus, and the very first frame is often dark.
-        for _ in range(5):
-            cap.read()
-        ok, frame = cap.read()
-    finally:
-        cap.release()
+        proc = subprocess.run(
+            [sys.executable, WEBCAM_WORKER_SCRIPT, out_path],
+            capture_output=True,
+            timeout=WEBCAM_CAPTURE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Webcam capture timed out after {WEBCAM_CAPTURE_TIMEOUT_SECONDS}s and was "
+            "killed to release the camera (driver may be stuck or camera in use elsewhere)."
+        )
 
-    if not ok:
-        raise RuntimeError("Failed to capture a frame from the webcam.")
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        stderr = proc.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"Webcam capture failed: {stderr or 'unknown error'}")
+
+    frame = cv2.imread(out_path)
+    if frame is None:
+        raise RuntimeError("Webcam capture produced an unreadable image.")
     return frame
 
 
