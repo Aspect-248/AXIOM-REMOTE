@@ -14,7 +14,7 @@ import time
 import urllib.request
 import winsound
 from ctypes import wintypes
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import psutil
 from dotenv import load_dotenv
@@ -862,7 +862,58 @@ async def _handle_get_file(update: Update, filename: str):
             log.exception("Also failed to send the error reply for: %s", filename)
 
 
-async def _execute_text_command(update: Update, raw_text: str):
+# --- Reminders & timers ---
+
+REMIND_IN_RE = re.compile(
+    r"(?i)^remind me (.+?) in (\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?|days?)$"
+)
+REMIND_AT_RE = re.compile(r"(?i)^remind me (.+?) at (\d{1,2})(?::(\d{2}))?\s*(am|pm)?$")
+TIMER_RE = re.compile(r"(?i)^timer\s+(\d+)\s*(minutes?|mins?)?$")
+
+_UNIT_SECONDS = {
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+    "day": 86400, "days": 86400,
+}
+
+
+def _parse_at_time(hour_str: str, minute_str: str | None, ampm: str | None):
+    """Return seconds from now until the next occurrence of the given
+    wall-clock time (today, or tomorrow if it's already passed).
+    Returns None if the time is invalid. Deliberately works in plain
+    local-time deltas rather than timezone-aware datetimes, so it
+    can't be thrown off by whatever timezone the job scheduler
+    defaults to."""
+    hour = int(hour_str)
+    minute = int(minute_str) if minute_str else 0
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        return None
+
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _reminder_fire(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=f"Reminder: {context.job.data}")
+
+
+async def _timer_fire(context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=ALLOWED_CHAT_ID, text=f"Timer done ({context.job.data} min)."
+    )
+
+
+async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str):
     """Resolve and run a command from plain text -- shared by the typed
     message path and the voice-transcription path."""
     raw_text = raw_text.strip()
@@ -870,6 +921,35 @@ async def _execute_text_command(update: Update, raw_text: str):
     get_match = re.match(r"(?i)^get\s+(.+)$", raw_text)
     if get_match:
         await _handle_get_file(update, get_match.group(1))
+        return
+
+    remind_in_match = REMIND_IN_RE.match(raw_text)
+    if remind_in_match:
+        text, amount, unit = remind_in_match.groups()
+        delay = int(amount) * _UNIT_SECONDS[unit.lower()]
+        context.job_queue.run_once(_reminder_fire, when=delay, data=text.strip())
+        await update.message.reply_text(f'Reminder set for {amount} {unit} from now: "{text.strip()}"')
+        return
+
+    remind_at_match = REMIND_AT_RE.match(raw_text)
+    if remind_at_match:
+        text, hour_str, minute_str, ampm = remind_at_match.groups()
+        delay = _parse_at_time(hour_str, minute_str, ampm)
+        if delay is None:
+            await update.message.reply_text("Couldn't parse that time.")
+            return
+        context.job_queue.run_once(_reminder_fire, when=delay, data=text.strip())
+        eta = datetime.now() + timedelta(seconds=delay)
+        await update.message.reply_text(
+            f'Reminder set for {eta.strftime("%H:%M")}: "{text.strip()}"'
+        )
+        return
+
+    timer_match = TIMER_RE.match(raw_text)
+    if timer_match:
+        minutes = int(timer_match.group(1))
+        context.job_queue.run_once(_timer_fire, when=minutes * 60, data=minutes)
+        await update.message.reply_text(f"Timer set for {minutes} minute(s).")
         return
 
     prefix_match = re.match(r"(?i)^(say|type)\s+(.+)$", raw_text)
@@ -943,7 +1023,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
         return
 
-    await _execute_text_command(update, update.message.text or "")
+    await _execute_text_command(update, context, update.message.text or "")
 
 
 # Loaded lazily on first voice message so bot startup isn't slowed down
@@ -995,7 +1075,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     log.info("Transcribed voice message: %s", text)
     await update.message.reply_text(f'Heard: "{text}"')
-    await _execute_text_command(update, text)
+    await _execute_text_command(update, context, text)
 
 
 # Where files sent to the bot get saved.
@@ -1226,6 +1306,57 @@ async def check_intruder(context: ContextTypes.DEFAULT_TYPE):
         _intruder_alerted = False
 
 
+# Project folders to watch for uncommitted git changes. Add more paths
+# here for other repos you want reminders about.
+GIT_WATCH_FOLDERS = [
+    os.path.dirname(os.path.abspath(__file__)),  # this repo (telegram-remote)
+    r"C:\Users\abdal\OneDrive\Desktop\AXIOM_CANEV1",
+]
+GIT_CHECK_INTERVAL_SECONDS = 30 * 60
+
+_git_dirty_alerted = {}
+
+
+def _is_git_dirty(folder: str):
+    """Returns True/False, or None if the check itself failed (e.g.
+    git not found, folder missing) -- distinct from "no changes"."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=folder,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        log.exception("git status check failed for %s", folder)
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+async def check_git_status(context: ContextTypes.DEFAULT_TYPE):
+    for folder in GIT_WATCH_FOLDERS:
+        if not os.path.isdir(os.path.join(folder, ".git")):
+            continue
+
+        dirty = await asyncio.to_thread(_is_git_dirty, folder)
+        if dirty is None:
+            continue
+
+        was_alerted = _git_dirty_alerted.get(folder, False)
+        if dirty and not was_alerted:
+            _git_dirty_alerted[folder] = True
+            name = os.path.basename(folder)
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=f"Uncommitted changes in {name} -- don't forget to commit/push.",
+            )
+        elif not dirty:
+            _git_dirty_alerted[folder] = False
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
@@ -1242,6 +1373,9 @@ def main():
     )
     app.job_queue.run_repeating(
         check_intruder, interval=INTRUDER_CHECK_INTERVAL_SECONDS, first=30
+    )
+    app.job_queue.run_repeating(
+        check_git_status, interval=GIT_CHECK_INTERVAL_SECONDS, first=45
     )
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)

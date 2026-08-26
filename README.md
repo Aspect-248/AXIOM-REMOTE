@@ -72,6 +72,12 @@ any chat ID other than the one in `.env` are silently ignored.
   "you" for face recognition (one person only; re-run to replace)
 - `check camera` — on-demand check: is the person in view you, a
   stranger, or nobody?
+- `remind me <text> in <N> seconds/minutes/hours/days` — one-off
+  reminder, e.g. "remind me submit lab report in 2 hours"
+- `remind me <text> at <time>` — e.g. "remind me join class at 5pm"
+  or "at 14:30"; if that time already passed today, fires tomorrow
+- `timer <N>` / `timer <N> minutes` — plain countdown timer, messages
+  you when it's done
 
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
@@ -151,3 +157,11 @@ Model files live in `models/` (downloaded from the official
 `opencv/opencv_zoo` repo, checksum-verified); your registered face
 (`models/owner_face.npy`) is generated locally and gitignored -- it's
 personal biometric data, never committed.
+
+## Git reminder
+
+Every 30 minutes, checks a fixed list of project folders
+(`GIT_WATCH_FOLDERS` in `bot.py`) for uncommitted changes via `git
+status --porcelain`, and messages you once per folder if it finds
+any -- stays quiet again once you commit, until the next time it goes
+dirty. Add more folders to the list to watch other repos.
