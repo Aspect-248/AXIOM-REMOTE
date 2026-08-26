@@ -62,6 +62,17 @@ any chat ID other than the one in `.env` are silently ignored.
 - `type <text>` — copies the text to the clipboard and pastes it into
   whatever window currently has focus on the laptop (note: this
   overwrites your current clipboard contents)
+- `calc <expression>` — safe arithmetic (`+ - * / // % **`, parens,
+  and `sqrt/sin/cos/tan/log/log10/log2/exp/abs/round/floor/ceil/
+  radians/degrees`, plus `pi/e/tau`). Not `eval()` -- a whitelisted
+  AST evaluator, so arbitrary code can't run through it.
+- `print <filename>` — sends a file from Desktop/Downloads/Documents
+  to the default printer. Depends on Windows having a working "print"
+  file association for that extension -- if that's broken (e.g. after
+  uninstalling a PDF reader), you'll get a clear error saying so
+  rather than a silent failure.
+- `read <filename>` — reads a `.txt`/`.pdf`/etc. file out loud via
+  TTS (first 2000 characters, truncated beyond that)
 - `record` — records an 8-second screen capture and sends it back as
   a video
 - `prank` — swaps the mouse buttons for 20s, wiggles the cursor, says

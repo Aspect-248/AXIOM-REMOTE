@@ -9,3 +9,4 @@ numpy
 imageio-ffmpeg
 faster-whisper
 winsdk
+pypdf

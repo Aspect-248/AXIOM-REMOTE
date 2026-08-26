@@ -1,8 +1,11 @@
 import asyncio
+import ast
 import ctypes
 import difflib
 import json
 import logging
+import math
+import operator
 import os
 import random
 import re
@@ -702,6 +705,138 @@ def find_file(filename: str):
     return matches[0] if matches else None
 
 
+def print_file(filename: str) -> str:
+    filename = filename.strip().strip("<>").strip()
+    path = find_file(filename)
+    if path is None:
+        folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
+        return f"No file matching '{filename}' found in {folders}."
+
+    try:
+        os.startfile(path, "print")
+    except OSError as e:
+        if e.winerror == 1155:
+            ext = os.path.splitext(path)[1] or "this file type"
+            return (
+                f"Can't print {os.path.basename(path)}: no app with a working "
+                f"'print' action is set for {ext} files (Settings > Apps > "
+                f"Default apps may need fixing, e.g. after uninstalling a PDF reader)."
+            )
+        return f"Failed to print {os.path.basename(path)}: {e}"
+    except Exception as e:
+        return f"Failed to print {os.path.basename(path)}: {e}"
+    return f"Sent to printer: {os.path.basename(path)}"
+
+
+READ_ALOUD_CHAR_LIMIT = 2000
+
+
+def read_file_aloud(filename: str) -> str:
+    filename = filename.strip().strip("<>").strip()
+    path = find_file(filename)
+    if path is None:
+        folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
+        return f"No file matching '{filename}' found in {folders}."
+
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".pdf":
+            from pypdf import PdfReader
+
+            reader = PdfReader(path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        else:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+    except Exception as e:
+        return f"Couldn't read {os.path.basename(path)}: {e}"
+
+    text = text.strip()
+    if not text:
+        return f"{os.path.basename(path)} has no readable text."
+
+    truncated = len(text) > READ_ALOUD_CHAR_LIMIT
+    say(text[:READ_ALOUD_CHAR_LIMIT])
+
+    note = f" (first {READ_ALOUD_CHAR_LIMIT} characters -- truncated)" if truncated else ""
+    return f"Reading {os.path.basename(path)} aloud{note}."
+
+
+# Safe arithmetic evaluator for "calc" -- deliberately NOT eval() on
+# raw user text. Whitelists specific AST node types, operators, and
+# math functions; anything else (attribute access, subscripts,
+# arbitrary calls, etc.) is rejected before it can ever run.
+_CALC_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+_CALC_NAMES = {"pi": math.pi, "e": math.e, "tau": math.tau}
+
+_CALC_FUNCTIONS = {
+    "sqrt": math.sqrt,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log,
+    "log10": math.log10,
+    "log2": math.log2,
+    "exp": math.exp,
+    "abs": abs,
+    "round": round,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "radians": math.radians,
+    "degrees": math.degrees,
+}
+
+
+def _calc_eval(node):
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Only numbers are allowed.")
+    if isinstance(node, ast.BinOp):
+        op_func = _CALC_OPERATORS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Operator not allowed: {type(node.op).__name__}")
+        return op_func(_calc_eval(node.left), _calc_eval(node.right))
+    if isinstance(node, ast.UnaryOp):
+        op_func = _CALC_OPERATORS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Operator not allowed: {type(node.op).__name__}")
+        return op_func(_calc_eval(node.operand))
+    if isinstance(node, ast.Name):
+        if node.id in _CALC_NAMES:
+            return _CALC_NAMES[node.id]
+        raise ValueError(f"Unknown name: {node.id}")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _CALC_FUNCTIONS:
+            raise ValueError("Only specific math functions are allowed.")
+        args = [_calc_eval(a) for a in node.args]
+        return _CALC_FUNCTIONS[node.func.id](*args)
+    raise ValueError(f"Expression not allowed: {type(node).__name__}")
+
+
+def calc(expression: str) -> str:
+    expression = expression.strip()
+    try:
+        tree = ast.parse(expression, mode="eval")
+        result = _calc_eval(tree.body)
+    except ZeroDivisionError:
+        return "Error: division by zero."
+    except Exception as e:
+        return f"Couldn't evaluate '{expression}': {e}"
+    return f"{expression} = {result}"
+
+
 # Allowlist: only these exact phrases (case-insensitive) do anything.
 # Deliberately NOT a generic "run whatever text you send" handler --
 # this bot has real access to the machine, so the set of things it can
@@ -742,6 +877,9 @@ COMMANDS = {
 PREFIX_COMMANDS = {
     "say": say,
     "type": type_text,
+    "calc": calc,
+    "print": print_file,
+    "read": read_file_aloud,
 }
 
 # Alternate phrasings that resolve to a command above. Still a fixed,
@@ -952,7 +1090,7 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"Timer set for {minutes} minute(s).")
         return
 
-    prefix_match = re.match(r"(?i)^(say|type)\s+(.+)$", raw_text)
+    prefix_match = re.match(r"(?i)^(say|type|calc|print|read)\s+(.+)$", raw_text)
     if prefix_match:
         verb = prefix_match.group(1).lower()
         arg = prefix_match.group(2)
