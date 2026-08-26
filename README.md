@@ -124,8 +124,8 @@ of taking the whole bot down.
 ## Face recognition / intruder alert
 
 Setup: send `register face` once, facing the webcam. After that, the
-bot checks the webcam every minute and messages you unprompted with a
-photo if it sees a face that isn't you. No command needed once
+bot checks the webcam every 30 minutes and messages you unprompted
+with a photo if it sees a face that isn't you. No command needed once
 registered; `check camera` runs the same check on demand for testing.
 
 Heads up: this means the webcam LED will blink briefly every check,

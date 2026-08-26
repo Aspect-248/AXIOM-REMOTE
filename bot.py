@@ -1199,7 +1199,7 @@ async def check_notifications(context: ContextTypes.DEFAULT_TYPE):
 
 
 # Every check briefly lights up the webcam LED.
-INTRUDER_CHECK_INTERVAL_SECONDS = 60
+INTRUDER_CHECK_INTERVAL_SECONDS = 30 * 60
 
 _intruder_alerted = False
 
