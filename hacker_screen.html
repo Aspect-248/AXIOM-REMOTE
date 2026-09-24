@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>.</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    overflow: hidden;
+    cursor: none;
+    height: 100%;
+    width: 100%;
+  }
+  canvas { position: absolute; top: 0; left: 0; }
+  #terminal {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    padding: 40px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 22px;
+    color: #00ff41;
+    text-shadow: 0 0 6px #00ff41;
+    white-space: pre-wrap;
+    z-index: 10;
+  }
+  #cursor {
+    display: inline-block;
+    width: 12px;
+    height: 22px;
+    background: #00ff41;
+    animation: blink 0.8s steps(1) infinite;
+    vertical-align: middle;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<canvas id="matrix"></canvas>
+<div id="terminal"></div>
+<script>
+  // Matrix rain
+  const canvas = document.getElementById('matrix');
+  const ctx = canvas.getContext('2d');
+  function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const chars = "アカサタナハマヤラワ0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const fontSize = 18;
+  let columns = Math.floor(canvas.width / fontSize);
+  let drops = Array(columns).fill(1);
+
+  function drawMatrix() {
+    ctx.fillStyle = "rgba(0,0,0,0.08)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#00ff41";
+    ctx.font = fontSize + "px monospace";
+    for (let i = 0; i < drops.length; i++) {
+      const text = chars[Math.floor(Math.random() * chars.length)];
+      ctx.fillText(text, i * fontSize, drops[i] * fontSize);
+      if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) drops[i] = 0;
+      drops[i]++;
+    }
+  }
+  setInterval(drawMatrix, 40);
+
+  // Fake terminal sequence
+  const lines = [
+    "root@axiom:~# initiating_sequence.sh",
+    "[OK] Establishing secure uplink...",
+    "[OK] Spoofing MAC address... DONE",
+    "[OK] Bypassing firewall.......... 100%",
+    "[OK] Cracking WPA2 handshake..... 100%",
+    "[OK] Decrypting payload.......... 100%",
+    "root@axiom:~# access mainframe --force",
+    "> Scanning 254 hosts on subnet...",
+    "> Found 1 vulnerable target",
+    "> Deploying exploit kit...",
+    "> Escalating privileges to root...",
+    "",
+    "  ACCESS GRANTED",
+    "",
+    "you have been hacked (not really, relax)",
+  ];
+
+  const term = document.getElementById('terminal');
+  let lineIndex = 0, charIndex = 0;
+  let buffer = "";
+
+  function typeNext() {
+    if (lineIndex >= lines.length) {
+      term.innerHTML = buffer + '<span id="cursor"></span>';
+      return;
+    }
+    const line = lines[lineIndex];
+    if (charIndex < line.length) {
+      buffer += line[charIndex];
+      charIndex++;
+      term.innerHTML = buffer + '<span id="cursor"></span>';
+      setTimeout(typeNext, 12 + Math.random() * 18);
+    } else {
+      buffer += "\n";
+      lineIndex++;
+      charIndex = 0;
+      setTimeout(typeNext, 120);
+    }
+  }
+  setTimeout(typeNext, 400);
+</script>
+</body>
+</html>

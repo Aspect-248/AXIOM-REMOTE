@@ -95,6 +95,14 @@ any chat ID other than the one in `.env` are silently ignored.
   or "at 14:30"; if that time already passed today, fires tomorrow
 - `timer <N>` / `timer <N> minutes` — plain countdown timer, messages
   you when it's done
+- `hacker screen` — full-screen Matrix rain + a fake hacking terminal
+  sequence for ~20s, purely cosmetic theater (not a fake virus/
+  ransomware warning -- deliberately over-the-top instead), then
+  closes itself automatically
+- `scan network` — ping-sweeps your subnet and lists every responding
+  device's IP/MAC (and hostname where resolvable)
+- `listen` — records ~6 seconds from the microphone and sends it back
+  as an audio clip
 
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
@@ -200,6 +208,32 @@ Every 30 minutes, checks a fixed list of project folders
 status --porcelain`, and messages you once per folder if it finds
 any -- stays quiet again once you commit, until the next time it goes
 dirty. Add more folders to the list to watch other repos.
+
+## USB device monitor
+
+Every 60 seconds, messages you unprompted the name of any USB device
+that gets plugged in (via `Get-PnpDevice`). Whatever's already
+plugged in when the bot starts is used as a baseline, not reported.
+
+## Hacker screen reliability
+
+`hacker screen` launches a dedicated, isolated Edge kiosk window
+(`--user-data-dir` set to a fresh temp folder so it can't collide
+with or get confused for your normal browsing) and closes it via
+`hacker_screen_watchdog.py`, run as its own independent OS process
+rather than a thread inside the bot -- so it still closes the window
+on schedule even if the bot restarts or crashes while it's showing.
+
+Getting the close to actually work reliably took real iteration:
+Edge relaunches itself internally after the initial launch, so the
+PID the bot gets back from launching it often doesn't match the
+actual running browser process anymore by the time the close fires --
+tracking by PID alone left the whole process tree (browser + gpu +
+renderer + crashpad + utility) orphaned. The watchdog instead matches
+every process by the unique `--user-data-dir` path in its command
+line (shared by the whole tree regardless of any internal relaunch),
+and retries the kill pass since a single pass can still miss
+processes if it runs mid-relaunch.
 
 ## Console-flash fix
 

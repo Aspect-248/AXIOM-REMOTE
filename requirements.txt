@@ -10,3 +10,4 @@ imageio-ffmpeg
 faster-whisper
 winsdk
 pypdf
+sounddevice

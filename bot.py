@@ -1,5 +1,6 @@
 import asyncio
 import ast
+import concurrent.futures
 import ctypes
 import difflib
 import json
@@ -9,12 +10,14 @@ import operator
 import os
 import random
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 import winsound
 from ctypes import wintypes
 from datetime import datetime, timedelta
@@ -735,6 +738,182 @@ def prank_mode():
     )
 
 
+HACKER_SCREEN_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hacker_screen.html")
+HACKER_SCREEN_WATCHDOG_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hacker_screen_watchdog.py"
+)
+HACKER_SCREEN_DURATION_SECONDS = 20
+
+
+def _find_edge_exe():
+    for path in (
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def hacker_screen() -> str:
+    """Purely cosmetic full-screen theater -- Matrix rain + a fake
+    hacking terminal sequence, auto-closes itself. Deliberately over-
+    the-top rather than a realistic fake warning/virus alert, so
+    nobody watching could mistake it for a genuine threat."""
+    edge_exe = _find_edge_exe()
+    if edge_exe is None:
+        return "Couldn't find Microsoft Edge to run this in."
+
+    # A dedicated --user-data-dir forces a genuinely separate browser
+    # process even if Edge is already open elsewhere, and doubles as a
+    # unique marker the watchdog can use to find every process in this
+    # launch's tree later (see hacker_screen_watchdog.py -- the PID
+    # returned here can go stale if Edge relaunches itself).
+    user_data_dir = os.path.join(tempfile.gettempdir(), f"axiom_kiosk_{uuid.uuid4().hex}")
+
+    subprocess.Popen(
+        [
+            edge_exe,
+            "--kiosk", HACKER_SCREEN_HTML,
+            "--edge-kiosk-type=fullscreen",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+        ],
+        creationflags=NO_CONSOLE_WINDOW,
+    )
+
+    # A genuinely independent process, not a thread inside this bot --
+    # see hacker_screen_watchdog.py for why.
+    subprocess.Popen(
+        [
+            sys.executable,
+            HACKER_SCREEN_WATCHDOG_SCRIPT,
+            user_data_dir,
+            str(HACKER_SCREEN_DURATION_SECONDS),
+            user_data_dir,
+        ],
+        creationflags=NO_CONSOLE_WINDOW,
+    )
+    return f"Hacker screen activated for {HACKER_SCREEN_DURATION_SECONDS}s."
+
+
+def _get_local_subnet():
+    """Return (network_prefix, own_ip), e.g. ('192.168.1.', '192.168.1.42')."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        own_ip = s.getsockname()[0]
+    finally:
+        s.close()
+    prefix = ".".join(own_ip.split(".")[:3]) + "."
+    return prefix, own_ip
+
+
+def _resolve_hostname(ip: str):
+    try:
+        name = socket.gethostbyaddr(ip)[0]
+        return None if name == ip else name
+    except Exception:
+        return None
+
+
+def scan_network() -> str:
+    prefix, own_ip = _get_local_subnet()
+
+    def ping(i):
+        subprocess.run(
+            ["ping", "-n", "1", "-w", "300", f"{prefix}{i}"],
+            capture_output=True,
+            creationflags=NO_CONSOLE_WINDOW,
+        )
+
+    # Ping-sweep the subnet first to populate the ARP cache -- arp -a
+    # alone only shows devices already recently communicated with.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        list(executor.map(ping, range(1, 255)))
+
+    result = subprocess.run(
+        ["arp", "-a"], capture_output=True, text=True, creationflags=NO_CONSOLE_WINDOW
+    )
+
+    # arp -a prints a separate table per network interface, so the
+    # same IP (especially multicast groups) can appear more than
+    # once if the machine has multiple adapters -- dedupe by IP.
+    seen_ips = set()
+    devices = []
+    mac_re = re.compile(r"^([0-9a-f]{2}-){5}[0-9a-f]{2}$", re.I)
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[0]):
+            continue
+        ip, mac = parts[0], parts[1]
+        if ip in seen_ips:
+            continue
+        if mac.lower() == "ff-ff-ff-ff-ff-ff" or not mac_re.match(mac):
+            continue
+        first_octet = int(ip.split(".")[0])
+        if 224 <= first_octet <= 239:
+            continue  # multicast group address, not a real device
+        seen_ips.add(ip)
+        devices.append((ip, mac))
+
+    if not devices:
+        return "No devices found on the network."
+
+    # Bound hostname lookups so a handful of slow/unresponsive
+    # devices can't stall the whole scan.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        hostnames = list(executor.map(lambda d: _resolve_hostname(d[0]), devices))
+
+    lines = [f"Found {len(devices)} device(s) on {prefix}0/24 (you: {own_ip}):"]
+    for (ip, mac), hostname in zip(devices, hostnames):
+        label = f" ({hostname})" if hostname else ""
+        lines.append(f"{ip}  {mac}{label}")
+
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        # Telegram's message limit is 4096 chars -- a large shared
+        # network (campus/office wifi rather than a home LAN) can
+        # exceed that. Truncate rather than fail outright.
+        text = text[:3800] + "\n... (truncated, too many devices to list in full)"
+    return text
+
+
+MIC_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mic_worker.py")
+LISTEN_DURATION_SECONDS = 6
+LISTEN_TIMEOUT_SECONDS = LISTEN_DURATION_SECONDS + 15
+
+
+def listen():
+    """Record a short clip from the microphone, via an isolated
+    subprocess with a hard timeout -- same reasoning as the webcam:
+    a hung audio-driver call could otherwise leave the mic indicator
+    stuck on indefinitely with no way to recover short of killing the
+    whole bot."""
+    out_path = os.path.join(tempfile.gettempdir(), "axiom_listen.wav")
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, MIC_WORKER_SCRIPT, out_path, str(LISTEN_DURATION_SECONDS)],
+            capture_output=True,
+            timeout=LISTEN_TIMEOUT_SECONDS,
+            creationflags=NO_CONSOLE_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Mic recording timed out after {LISTEN_TIMEOUT_SECONDS}s and was killed "
+            "(driver may be stuck or mic in use elsewhere)."
+        )
+
+    if proc.returncode != 0 or not os.path.exists(out_path):
+        stderr = proc.stderr.decode(errors="replace").strip()
+        raise RuntimeError(f"Mic recording failed: {stderr or 'unknown error'}")
+
+    return {"audio": out_path}
+
+
 POWERSHELL_EXE = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
@@ -1006,6 +1185,9 @@ COMMANDS = {
     "record": screen_record,
     "find": find_laptop,
     "prank": prank_mode,
+    "hacker screen": hacker_screen,
+    "scan network": scan_network,
+    "listen": listen,
     "status": status,
     "stats": stats,
     "play pause": media_play_pause,
@@ -1078,6 +1260,17 @@ ALIASES = {
     "troll": "prank",
     "record screen": "record",
     "video": "record",
+    "hollywood": "hacker screen",
+    "im in": "hacker screen",
+    "hack": "hacker screen",
+    "wifi scan": "scan network",
+    "who is on my wifi": "scan network",
+    "whos on my wifi": "scan network",
+    "network scan": "scan network",
+    "scan wifi": "scan network",
+    "listen in": "listen",
+    "hear": "listen",
+    "what do you hear": "listen",
     "find laptop": "find",
     "find my laptop": "find",
     "locate": "find",
@@ -1277,6 +1470,10 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             f"Recording for {SCREEN_RECORD_DURATION_SECONDS}s starting now..."
         )
+    elif canonical == "scan network":
+        await update.message.reply_text("Scanning the network, give it a few seconds...")
+    elif canonical == "listen":
+        await update.message.reply_text(f"Listening for {LISTEN_DURATION_SECONDS}s...")
 
     try:
         result = handler()
@@ -1305,6 +1502,9 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     elif isinstance(result, dict) and "video" in result:
         with open(result["video"], "rb") as f:
             await update.message.reply_video(f, caption=result.get("caption"))
+    elif isinstance(result, dict) and "audio" in result:
+        with open(result["audio"], "rb") as f:
+            await update.message.reply_audio(f, caption=result.get("caption"))
     else:
         await update.message.reply_text(result)
 
@@ -1666,6 +1866,56 @@ async def check_git_status(context: ContextTypes.DEFAULT_TYPE):
             _git_dirty_alerted[folder] = False
 
 
+# Cheap, no camera/mic involved, so this can run frequently.
+USB_CHECK_INTERVAL_SECONDS = 60
+
+_known_usb_devices = None
+
+
+def _list_usb_devices():
+    """Returns a set of friendly names for currently-present USB
+    devices, or None if the check itself failed."""
+    script = (
+        "Get-PnpDevice -PresentOnly | Where-Object { $_.InstanceId -like 'USB\\*' } "
+        "| Select-Object -ExpandProperty FriendlyName"
+    )
+    try:
+        result = subprocess.run(
+            [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=NO_CONSOLE_WINDOW,
+        )
+    except Exception:
+        log.exception("USB device list check failed")
+        return None
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+async def check_usb_devices(context: ContextTypes.DEFAULT_TYPE):
+    global _known_usb_devices
+
+    current = await asyncio.to_thread(_list_usb_devices)
+    if current is None:
+        return
+
+    if _known_usb_devices is None:
+        # First run: baseline whatever's already plugged in, don't
+        # alert for it.
+        _known_usb_devices = current
+        return
+
+    for device in current - _known_usb_devices:
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID, text=f"USB device connected: {device}"
+        )
+
+    _known_usb_devices = current
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN is not set (see .env.example)")
@@ -1685,6 +1935,9 @@ def main():
     )
     app.job_queue.run_repeating(
         check_git_status, interval=GIT_CHECK_INTERVAL_SECONDS, first=45
+    )
+    app.job_queue.run_repeating(
+        check_usb_devices, interval=USB_CHECK_INTERVAL_SECONDS, first=15
     )
 
     log.info("Bot starting, listening for commands from chat_id=%s", ALLOWED_CHAT_ID)
