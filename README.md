@@ -176,3 +176,15 @@ Every 30 minutes, checks a fixed list of project folders
 status --porcelain`, and messages you once per folder if it finds
 any -- stays quiet again once you commit, until the next time it goes
 dirty. Add more folders to the list to watch other repos.
+
+## Console-flash fix
+
+The bot runs windowless via `pythonw.exe`. Launching a console-
+subsystem program (`git`, `powershell`, `cmd` via `shell=True`,
+`shutdown`) from a windowless process gives Windows nothing to attach
+its console to, so it briefly creates and shows one anyway -- this
+was visible as a quick double CMD-window flash roughly every 30
+minutes (`git status` runs once per `GIT_WATCH_FOLDERS` entry, so two
+folders = two flashes back to back, close in time to the intruder
+check since both run on the same interval). Every such subprocess
+call now passes `creationflags=NO_CONSOLE_WINDOW` to suppress it.

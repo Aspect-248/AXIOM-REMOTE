@@ -36,9 +36,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("telegram-remote")
 
+# The bot runs windowless via pythonw.exe. Launching a console-subsystem
+# program from it (cmd, git, powershell, shutdown -- anything without
+# its own GUI) has no console to attach to, so Windows briefly creates
+# and shows one just for that process. Passed to every subprocess call
+# that invokes one, to suppress that flash.
+NO_CONSOLE_WINDOW = subprocess.CREATE_NO_WINDOW
+
 
 def open_chrome():
-    subprocess.Popen("start chrome", shell=True)
+    subprocess.Popen("start chrome", shell=True, creationflags=NO_CONSOLE_WINDOW)
     return "Opening Chrome."
 
 
@@ -63,7 +70,9 @@ def open_desktop():
 
 
 def open_vscode():
-    subprocess.Popen("code .", shell=True, cwd=os.path.expanduser("~"))
+    subprocess.Popen(
+        "code .", shell=True, cwd=os.path.expanduser("~"), creationflags=NO_CONSOLE_WINDOW
+    )
     return "Opening VS Code."
 
 
@@ -79,22 +88,30 @@ SHUTDOWN_DELAY_SECONDS = 60
 
 
 def shutdown_pc():
-    subprocess.run(["shutdown", "/s", "/t", str(SHUTDOWN_DELAY_SECONDS)])
+    subprocess.run(
+        ["shutdown", "/s", "/t", str(SHUTDOWN_DELAY_SECONDS)], creationflags=NO_CONSOLE_WINDOW
+    )
     return f"Shutting down in {SHUTDOWN_DELAY_SECONDS}s. Send 'cancel shutdown' to abort."
 
 
 def restart_pc():
-    subprocess.run(["shutdown", "/r", "/t", str(SHUTDOWN_DELAY_SECONDS)])
+    subprocess.run(
+        ["shutdown", "/r", "/t", str(SHUTDOWN_DELAY_SECONDS)], creationflags=NO_CONSOLE_WINDOW
+    )
     return f"Restarting in {SHUTDOWN_DELAY_SECONDS}s. Send 'cancel shutdown' to abort."
 
 
 def cancel_shutdown():
-    subprocess.run(["shutdown", "/a"])
+    subprocess.run(["shutdown", "/a"], creationflags=NO_CONSOLE_WINDOW)
     return "Pending shutdown/restart cancelled."
 
 
 def sleep_pc():
-    subprocess.Popen("rundll32.exe powrprof.dll,SetSuspendState 0,1,0", shell=True)
+    subprocess.Popen(
+        "rundll32.exe powrprof.dll,SetSuspendState 0,1,0",
+        shell=True,
+        creationflags=NO_CONSOLE_WINDOW,
+    )
     return "Sleeping."
 
 
@@ -163,6 +180,7 @@ def _capture_webcam_frame():
             [sys.executable, WEBCAM_WORKER_SCRIPT, out_path],
             capture_output=True,
             timeout=WEBCAM_CAPTURE_TIMEOUT_SECONDS,
+            creationflags=NO_CONSOLE_WINDOW,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
@@ -349,7 +367,11 @@ def screen_record():
         path,
     ]
     proc = subprocess.Popen(
-        cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=NO_CONSOLE_WINDOW,
     )
 
     try:
@@ -614,6 +636,7 @@ def say(text: str) -> str:
     proc = subprocess.Popen(
         [POWERSHELL_EXE, "-NoProfile", "-NonInteractive", "-Command", script],
         stdin=subprocess.PIPE,
+        creationflags=NO_CONSOLE_WINDOW,
     )
     proc.stdin.write(text.encode("utf-8"))
     proc.stdin.close()
@@ -638,6 +661,7 @@ def type_text(text: str) -> str:
         input=text,
         text=True,
         timeout=10,
+        creationflags=NO_CONSOLE_WINDOW,
     )
     time.sleep(0.2)
 
@@ -1350,6 +1374,7 @@ def _run_notification_worker(*args, timeout=20):
             [sys.executable, NOTIFICATION_WORKER_SCRIPT, *args],
             capture_output=True,
             timeout=timeout,
+            creationflags=NO_CONSOLE_WINDOW,
         )
     except subprocess.TimeoutExpired:
         log.warning("Notification worker timed out: %s", args)
@@ -1465,6 +1490,7 @@ def _is_git_dirty(folder: str):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=NO_CONSOLE_WINDOW,
         )
     except Exception:
         log.exception("git status check failed for %s", folder)
