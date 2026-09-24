@@ -79,10 +79,16 @@ any chat ID other than the one in `.env` are silently ignored.
   something silly out loud, and opens a fresh Notepad window with a
   silly message typed into it (never touches any other already-open
   Notepad window)
-- `register face` — captures a webcam frame and registers it as
-  "you" for face recognition (one person only; re-run to replace)
-- `check camera` — on-demand check: is the person in view you, a
-  stranger, or nobody?
+- `register face` — registers you (the primary owner) for face
+  recognition, 3 samples; re-run to replace
+- `register face as <name>` — registers another specific person by
+  name (e.g. "register face as Mum"), 5 samples; they sit in front of
+  the webcam the same way. Re-using a name replaces that person's
+  previous registration. Any number of named people can coexist
+  alongside the owner.
+- `check camera` — on-demand check: reports who's in view by name
+  ("That's you and Mum -- recognized"), an unrecognized face, or
+  nobody
 - `remind me <text> in <N> seconds/minutes/hours/days` — one-off
   reminder, e.g. "remind me submit lab report in 2 hours"
 - `remind me <text> at <time>` — e.g. "remind me join class at 5pm"
@@ -144,14 +150,21 @@ Setup: send `register face` once, facing the webcam -- it takes 3
 quick samples a moment apart (helps it generalize across lighting/
 angle rather than relying on one snapshot). After that, the bot
 checks the webcam every 30 minutes and messages you unprompted with a
-photo if it sees a face that isn't you. No command needed once
+photo if it sees a face that isn't recognized. No command needed once
 registered; `check camera` runs the same check on demand for testing.
+
+Beyond just you, `register face as <name>` registers any number of
+other specific people by name (5 samples each -- they sit in front of
+the webcam the same way, one person in frame at a time). Anyone
+registered, under any name, counts as recognized; `check camera`
+reports who specifically it saw (e.g. "That's you and Mum --
+recognized"). Re-using a name replaces that person's previous
+registration; each identity's samples are only ever matched against
+each other, never mixed together.
 
 Heads up: this means the webcam LED will blink briefly every check,
 even though nothing was asked of it -- that's the visible tradeoff of
-proactive (vs. on-demand) monitoring. Only recognizes one person
-("you" vs. "not you") -- re-running `register face` replaces the
-previous registration rather than adding a second person.
+proactive (vs. on-demand) monitoring.
 
 Two things specifically to cut false "unrecognized face" alerts on
 the real owner (a single cosine-similarity check against one
@@ -175,9 +188,10 @@ Uses OpenCV's built-in YuNet (detection) + SFace (recognition) DNN
 models rather than the `dlib`-based `face_recognition` package, which
 needs a C++ compiler toolchain to install on Windows and often fails.
 Model files live in `models/` (downloaded from the official
-`opencv/opencv_zoo` repo, checksum-verified); your registered face
-(`models/owner_face.npy`) is generated locally and gitignored -- it's
-personal biometric data, never committed.
+`opencv/opencv_zoo` repo, checksum-verified); registered faces
+(`models/owner_face.npy` and `models/known_faces/*.npy`) are
+generated locally and gitignored -- personal biometric data, never
+committed.
 
 ## Git reminder
 

@@ -259,35 +259,112 @@ def _face_embedding(frame, face_box):
 # A single reference photo doesn't generalize well across lighting,
 # angle, expression, or glasses on/off -- enrolling several samples
 # and matching against the BEST of all of them (rather than one)
-# meaningfully cuts false "unrecognized" alerts on the real owner
-# without loosening the match threshold itself.
+# meaningfully cuts false "unrecognized" alerts on a real registered
+# person without loosening the match threshold itself.
 FACE_REGISTRATION_SHOTS = 3
+NAMED_FACE_REGISTRATION_SHOTS = 5
 FACE_REGISTRATION_SHOT_DELAY_SECONDS = 0.6
 
+# Additional named people beyond the primary owner. One .npy file per
+# person (their multi-shot embeddings), named after them.
+KNOWN_FACES_DIR = os.path.join(FACE_MODELS_DIR, "known_faces")
 
-def register_face():
-    import numpy as np
 
+def _capture_face_samples(num_shots: int):
+    """Capture `num_shots` face embeddings a moment apart, one person
+    at a time. Returns (embeddings_list, None) on success, or
+    (None, error_message) if it couldn't get any usable samples."""
     embeddings = []
     attempts = 0
-    max_attempts = FACE_REGISTRATION_SHOTS * 3
-    while len(embeddings) < FACE_REGISTRATION_SHOTS and attempts < max_attempts:
+    max_attempts = num_shots * 3
+    while len(embeddings) < num_shots and attempts < max_attempts:
         attempts += 1
         frame = _capture_webcam_frame()
         faces = _detect_faces(frame)
         if len(faces) > 1:
-            return f"Detected {len(faces)} faces -- make sure only you are in frame when registering."
+            return None, (
+                f"Detected {len(faces)} faces -- make sure only one person "
+                "is in frame when registering."
+            )
         if len(faces) == 1:
             embeddings.append(_face_embedding(frame, faces[0]))
         time.sleep(FACE_REGISTRATION_SHOT_DELAY_SECONDS)
 
     if not embeddings:
-        return "No face detected. Try again facing the camera with better lighting."
+        return None, "No face detected. Try again facing the camera with better lighting."
+    return embeddings, None
+
+
+def register_face():
+    import numpy as np
+
+    embeddings, error = _capture_face_samples(FACE_REGISTRATION_SHOTS)
+    if error:
+        return error
 
     os.makedirs(FACE_MODELS_DIR, exist_ok=True)
     np.save(OWNER_FACE_PATH, np.vstack(embeddings))
     plural = "s" if len(embeddings) != 1 else ""
     return f"Face registered ({len(embeddings)} sample{plural}). I'll now watch for unrecognized faces."
+
+
+def _sanitize_face_name(name: str) -> str:
+    name = name.strip()
+    name = re.sub(r"[^\w\s-]", "", name)
+    name = re.sub(r"\s+", "_", name)
+    return name.strip("_")
+
+
+def register_named_face(name: str) -> str:
+    import numpy as np
+
+    display_name = name.strip()
+    slug = _sanitize_face_name(display_name)
+    if not slug:
+        return "Give the person a name, e.g. 'register face as Mum'."
+
+    embeddings, error = _capture_face_samples(NAMED_FACE_REGISTRATION_SHOTS)
+    if error:
+        return error
+
+    os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+    np.save(os.path.join(KNOWN_FACES_DIR, f"{slug}.npy"), np.vstack(embeddings))
+    plural = "s" if len(embeddings) != 1 else ""
+    return f"Registered {display_name} ({len(embeddings)} sample{plural}). I'll now recognize them too."
+
+
+def _has_any_registered_face() -> bool:
+    if os.path.exists(OWNER_FACE_PATH):
+        return True
+    return os.path.isdir(KNOWN_FACES_DIR) and any(
+        f.endswith(".npy") for f in os.listdir(KNOWN_FACES_DIR)
+    )
+
+
+def _load_known_identities():
+    """Returns [(label, embeddings array shape (N, D)), ...] for the
+    owner (if registered) plus every named "register face as <name>"
+    entry."""
+    import numpy as np
+
+    identities = []
+    if os.path.exists(OWNER_FACE_PATH):
+        owner_embeddings = np.load(OWNER_FACE_PATH)
+        if owner_embeddings.ndim == 1:
+            owner_embeddings = owner_embeddings.reshape(1, -1)
+        identities.append(("you", owner_embeddings))
+
+    if os.path.isdir(KNOWN_FACES_DIR):
+        for filename in sorted(os.listdir(KNOWN_FACES_DIR)):
+            if not filename.endswith(".npy"):
+                continue
+            label = filename[:-4].replace("_", " ")
+            embeddings = np.load(os.path.join(KNOWN_FACES_DIR, filename))
+            if embeddings.ndim == 1:
+                embeddings = embeddings.reshape(1, -1)
+            identities.append((label, embeddings))
+
+    return identities
 
 
 def _best_match_score(recognizer, owner_embeddings, face_embedding):
@@ -306,48 +383,55 @@ def _best_match_score(recognizer, owner_embeddings, face_embedding):
 
 
 def _check_faces_sync():
-    """Capture a frame and compare any detected face(s) against the
-    registered owner. Returns (is_stranger, photo_path_or_None)."""
+    """Capture a frame and compare any detected face(s) against every
+    registered identity (owner + named people). Returns
+    (is_stranger, photo_path_or_None, matched_labels)."""
     import cv2
-    import numpy as np
 
     frame = _capture_webcam_frame()
     faces = _detect_faces(frame)
     if len(faces) == 0:
-        return False, None
+        return False, None, []
 
-    owner_embeddings = np.load(OWNER_FACE_PATH)
-    if owner_embeddings.ndim == 1:
-        owner_embeddings = owner_embeddings.reshape(1, -1)  # pre-multi-shot registrations
+    identities = _load_known_identities()
     _, recognizer = _get_face_models()
 
     stranger_found = False
+    matched_labels = []
     for face in faces:
         embedding = _face_embedding(frame, face)
-        score = _best_match_score(recognizer, owner_embeddings, embedding)
-        if score < FACE_MATCH_THRESHOLD:
+        best_label, best_score = None, -1.0
+        for label, embeddings in identities:
+            score = _best_match_score(recognizer, embeddings, embedding)
+            if score > best_score:
+                best_label, best_score = label, score
+
+        if best_score < FACE_MATCH_THRESHOLD:
             stranger_found = True
+        elif best_label:
+            matched_labels.append(best_label)
 
     if not stranger_found:
-        return False, None
+        return False, None, matched_labels
 
     path = os.path.join(tempfile.gettempdir(), "axiom_face_check.jpg")
     cv2.imwrite(path, frame)
-    return True, path
+    return True, path, matched_labels
 
 
 def check_camera_now():
     """On-demand version of the proactive check, for testing without
     waiting for the periodic job."""
-    if not os.path.exists(OWNER_FACE_PATH):
+    if not _has_any_registered_face():
         return "No face registered yet. Send 'register face' first."
 
-    is_stranger, photo_path = _check_faces_sync()
-    if photo_path is None:
-        return "No face currently in view." if not is_stranger else "Unclear result."
+    is_stranger, photo_path, matched_labels = _check_faces_sync()
     if is_stranger:
         return {"photo": photo_path, "caption": "Unrecognized face."}
-    return "That's you -- recognized."
+    if matched_labels:
+        who = " and ".join(sorted(set(matched_labels)))
+        return f"That's {who} -- recognized."
+    return "No face currently in view."
 
 
 SCREEN_RECORD_DURATION_SECONDS = 8
@@ -1119,6 +1203,19 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
         await _handle_get_file(update, get_match.group(1))
         return
 
+    register_named_match = re.match(r"(?i)^register face as\s+(.+)$", raw_text)
+    if register_named_match:
+        name = register_named_match.group(1)
+        log.info("Executing command: register face as %s", name)
+        try:
+            result = register_named_face(name)
+        except Exception as e:
+            log.exception("Command failed: register face as %s", name)
+            await update.message.reply_text(f"Command failed: {e}")
+            return
+        await update.message.reply_text(result)
+        return
+
     remind_in_match = REMIND_IN_RE.match(raw_text)
     if remind_in_match:
         text, amount, unit = remind_in_match.groups()
@@ -1484,22 +1581,22 @@ _intruder_alerted = False
 async def check_intruder(context: ContextTypes.DEFAULT_TYPE):
     global _intruder_alerted
 
-    if not os.path.exists(OWNER_FACE_PATH):
+    if not _has_any_registered_face():
         return  # nobody registered yet, nothing to compare against
 
     try:
-        is_stranger, photo_path = await asyncio.to_thread(_check_faces_sync)
+        is_stranger, photo_path, _ = await asyncio.to_thread(_check_faces_sync)
     except Exception:
         log.exception("Intruder check failed")
         return
 
     if is_stranger:
         # A single bad frame (blink, glare, brief bad angle) can make
-        # even the registered owner briefly fail to match. Only alert
+        # even a registered person briefly fail to match. Only alert
         # if a second frame, a couple seconds later, still disagrees.
         await asyncio.sleep(2)
         try:
-            confirm_stranger, confirm_photo = await asyncio.to_thread(_check_faces_sync)
+            confirm_stranger, confirm_photo, _ = await asyncio.to_thread(_check_faces_sync)
         except Exception:
             log.exception("Intruder confirmation check failed")
             confirm_stranger, confirm_photo = False, None
