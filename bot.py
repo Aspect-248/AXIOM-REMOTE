@@ -256,21 +256,53 @@ def _face_embedding(frame, face_box):
     return recognizer.feature(aligned)
 
 
+# A single reference photo doesn't generalize well across lighting,
+# angle, expression, or glasses on/off -- enrolling several samples
+# and matching against the BEST of all of them (rather than one)
+# meaningfully cuts false "unrecognized" alerts on the real owner
+# without loosening the match threshold itself.
+FACE_REGISTRATION_SHOTS = 3
+FACE_REGISTRATION_SHOT_DELAY_SECONDS = 0.6
+
+
 def register_face():
     import numpy as np
 
-    frame = _capture_webcam_frame()
-    faces = _detect_faces(frame)
+    embeddings = []
+    attempts = 0
+    max_attempts = FACE_REGISTRATION_SHOTS * 3
+    while len(embeddings) < FACE_REGISTRATION_SHOTS and attempts < max_attempts:
+        attempts += 1
+        frame = _capture_webcam_frame()
+        faces = _detect_faces(frame)
+        if len(faces) > 1:
+            return f"Detected {len(faces)} faces -- make sure only you are in frame when registering."
+        if len(faces) == 1:
+            embeddings.append(_face_embedding(frame, faces[0]))
+        time.sleep(FACE_REGISTRATION_SHOT_DELAY_SECONDS)
 
-    if len(faces) == 0:
+    if not embeddings:
         return "No face detected. Try again facing the camera with better lighting."
-    if len(faces) > 1:
-        return f"Detected {len(faces)} faces -- make sure only you are in frame when registering."
 
-    embedding = _face_embedding(frame, faces[0])
     os.makedirs(FACE_MODELS_DIR, exist_ok=True)
-    np.save(OWNER_FACE_PATH, embedding)
-    return "Face registered. I'll now watch for unrecognized faces."
+    np.save(OWNER_FACE_PATH, np.vstack(embeddings))
+    plural = "s" if len(embeddings) != 1 else ""
+    return f"Face registered ({len(embeddings)} sample{plural}). I'll now watch for unrecognized faces."
+
+
+def _best_match_score(recognizer, owner_embeddings, face_embedding):
+    """owner_embeddings is shape (N, D) from possibly-multi-shot
+    registration -- score against each and return the best match,
+    not just the first/only one."""
+    import cv2
+
+    best = -1.0
+    for i in range(owner_embeddings.shape[0]):
+        score = recognizer.match(
+            owner_embeddings[i : i + 1], face_embedding, cv2.FaceRecognizerSF_FR_COSINE
+        )
+        best = max(best, score)
+    return best
 
 
 def _check_faces_sync():
@@ -284,13 +316,15 @@ def _check_faces_sync():
     if len(faces) == 0:
         return False, None
 
-    owner_embedding = np.load(OWNER_FACE_PATH)
+    owner_embeddings = np.load(OWNER_FACE_PATH)
+    if owner_embeddings.ndim == 1:
+        owner_embeddings = owner_embeddings.reshape(1, -1)  # pre-multi-shot registrations
     _, recognizer = _get_face_models()
 
     stranger_found = False
     for face in faces:
         embedding = _face_embedding(frame, face)
-        score = recognizer.match(owner_embedding, embedding, cv2.FaceRecognizerSF_FR_COSINE)
+        score = _best_match_score(recognizer, owner_embeddings, embedding)
         if score < FACE_MATCH_THRESHOLD:
             stranger_found = True
 
@@ -1458,6 +1492,20 @@ async def check_intruder(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         log.exception("Intruder check failed")
         return
+
+    if is_stranger:
+        # A single bad frame (blink, glare, brief bad angle) can make
+        # even the registered owner briefly fail to match. Only alert
+        # if a second frame, a couple seconds later, still disagrees.
+        await asyncio.sleep(2)
+        try:
+            confirm_stranger, confirm_photo = await asyncio.to_thread(_check_faces_sync)
+        except Exception:
+            log.exception("Intruder confirmation check failed")
+            confirm_stranger, confirm_photo = False, None
+        is_stranger = confirm_stranger
+        if confirm_photo:
+            photo_path = confirm_photo
 
     if is_stranger and not _intruder_alerted:
         _intruder_alerted = True

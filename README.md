@@ -140,9 +140,11 @@ of taking the whole bot down.
 
 ## Face recognition / intruder alert
 
-Setup: send `register face` once, facing the webcam. After that, the
-bot checks the webcam every 30 minutes and messages you unprompted
-with a photo if it sees a face that isn't you. No command needed once
+Setup: send `register face` once, facing the webcam -- it takes 3
+quick samples a moment apart (helps it generalize across lighting/
+angle rather than relying on one snapshot). After that, the bot
+checks the webcam every 30 minutes and messages you unprompted with a
+photo if it sees a face that isn't you. No command needed once
 registered; `check camera` runs the same check on demand for testing.
 
 Heads up: this means the webcam LED will blink briefly every check,
@@ -150,6 +152,14 @@ even though nothing was asked of it -- that's the visible tradeoff of
 proactive (vs. on-demand) monitoring. Only recognizes one person
 ("you" vs. "not you") -- re-running `register face` replaces the
 previous registration rather than adding a second person.
+
+Two things specifically to cut false "unrecognized face" alerts on
+the real owner (a single cosine-similarity check against one
+reference photo turned out to misfire sometimes on lighting/angle/
+expression changes): registration matches against the best of all 3
+enrolled samples, not just one; and the proactive check only alerts
+if a *second* frame, taken ~2s after the first, also fails to match
+-- a single bad frame (blink, glare) no longer triggers it alone.
 
 Every webcam capture (this feature, `webcam`, `find`) runs through
 `webcam_worker.py` as a subprocess with a hard 15s timeout, not
