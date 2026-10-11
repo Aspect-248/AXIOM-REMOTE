@@ -104,8 +104,71 @@ any chat ID other than the one in `.env` are silently ignored.
 - `listen` — records ~6 seconds from the microphone and sends it back
   as an audio clip
 
+- `guard on` / `guard off` / `guard status` — bodyguard mode, see
+  [Guard mode](#guard-mode)
+- `ask <anything>` — plain-English requests, see [Ask mode](#ask-mode).
+  Any message that isn't a known command goes there too.
+
 Send a file or photo directly to the bot (no command needed) and it
 saves it to `~\Downloads\FromTelegram` on the laptop.
+
+## Ask mode
+
+Talk to the laptop in plain English: "send me the lab report I edited
+yesterday", "what's on my screen?", "is anyone at my laptop?", "turn the
+volume down and pause the music". Prefix with `ask` to force it, or just
+send the sentence -- anything that isn't a known command is routed
+here, and so are voice messages. If `get <something>` finds no matching
+file, the request also falls through to ask mode.
+
+Setup: add `ANTHROPIC_API_KEY=<key>` to `.env` (and optionally
+`CLAUDE_MODEL`, default `claude-opus-5-5`), `pip install anthropic`, and
+restart the bot. Without a key the bot behaves exactly as before.
+
+Claude only acts through a fixed toolbox in `bot.py` (`_build_agent_tools`):
+see the screen, send a screenshot / webcam photo, system stats, search
+file names, read and send files, open an app, volume, media keys, lock,
+speak, calculate, and toggle guard mode. It is **not** given shutdown,
+restart, sleep, `type`, `print`, `prank`, `hacker screen`, `find`,
+`record`, `listen`, or `scan network` -- those stay exact commands only
+you can type, so text it reads off the screen or inside a file can never
+steer it into them. File access is limited to Desktop/Documents/Downloads
+(including the OneDrive-redirected ones); this project's own folder,
+`.env*` files, and key/biometric file types are refused outright.
+
+It remembers the last few messages for 20 minutes (so "send it" works
+after "find my report") and caps itself at 30 requests an hour. Each
+request is a small Claude API call billed to your Anthropic account;
+screenshots add roughly a thousand tokens. Server-side refusal fallbacks
+are turned on, and the bot silently continues without them if the API
+rejects that option.
+
+## Guard mode
+
+`guard on` arms it (needs a registered face). Then, while armed:
+
+1. After 2 minutes with no keyboard/mouse input, the bot looks through
+   the webcam. If a registered face is in view you're just reading and
+   nothing happens (it re-checks every minute while you stay idle).
+2. If nobody is there, or a stranger is, it locks the laptop and tells
+   you.
+3. While locked, any keyboard/mouse activity triggers a webcam check:
+   a stranger or a faceless touch sends you a photo straight away; a
+   recognized face just gets a "recognized" note.
+4. A lock you did yourself (Win+L, `lock`) is picked up and watched the
+   same way. It tells you when the laptop is unlocked again.
+
+Armed state survives bot restarts (`guard_state.json`, gitignored). If
+the webcam can't be read (busy in a video call, say), it only locks
+after 4 minutes idle instead of 2. Like the intruder check, the webcam
+LED blinks during checks -- here about once a minute while the laptop
+sits idle and unlocked.
+
+Honest limits: this is detection plus a Windows lock, not encryption --
+someone with the hardware and time can still bypass a Windows lock, and
+the face check has no liveness test, so a photo of you held up to the
+camera can pass it. All webcam captures now take turns through a lock,
+since two at once would collide on the shared temp file.
 
 ## Voice commands
 

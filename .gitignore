@@ -7,3 +7,6 @@ __pycache__/
 # belongs in version control.
 models/owner_face.npy
 models/known_faces/
+
+# Local runtime state for guard mode.
+guard_state.json

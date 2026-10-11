@@ -11,3 +11,4 @@ faster-whisper
 winsdk
 pypdf
 sounddevice
+anthropic
