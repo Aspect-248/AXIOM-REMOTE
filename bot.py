@@ -30,6 +30,8 @@ from dotenv import load_dotenv
 from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
+import totp
+
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -2024,7 +2026,10 @@ async def _handle_agent(update: Update, text: str):
         await update.message.reply_text(f"Ask failed: {str(e)[:300]}")
         return
     _agent_outbox.clear()
+    await _deliver_agent_output(update, reply, outbox)
 
+
+async def _deliver_agent_output(update: Update, reply: str, outbox: list):
     # Guard changes come back as requests: the tool server runs in another
     # process and can't touch this process's guard state.
     notes = []
@@ -2054,6 +2059,175 @@ async def _handle_agent(update: Update, text: str):
                     os.remove(item.get("photo") or item["document"])
                 except OSError:
                     pass
+
+
+# --- Power mode ("do <task>") ---
+#
+# Same Claude Code backend and fence as ask mode, plus one extra tool:
+# run_powershell. Nothing it runs executes until you've seen the exact command
+# in Telegram and replied with a current one-time code from your authenticator
+# app (set up once with setup_totp.py, on the laptop's own screen -- the secret
+# never goes through Telegram). Each approval covers one command only, so
+# anything that tricks the model mid-task still has to get past you.
+TOTP_SECRET_FILE = os.path.join(_BOT_DIR, "totp_secret.txt")
+APPROVAL_TIMEOUT_SECONDS = 300
+APPROVAL_MAX_BAD_CODES = 3
+APPROVAL_LOCKOUT_SECONDS = 15 * 60
+
+DO_SYSTEM_PROMPT = (
+    AGENT_SYSTEM_PROMPT
+    + """
+
+POWER MODE: you also have run_powershell, which can do nearly anything the owner could do at the laptop, \
+but it is not elevated (no admin rights), so say so if a task needs admin. Every command is shown to the \
+owner in Telegram and runs only after they approve it with a one-time code, one command at a time. So: \
+prefer a few small, readable commands over one big script, never obfuscate or chain unrelated actions, and \
+give an honest one-line purpose for each. If a command is denied or times out, stop and report instead of \
+retrying or trying a sneakier route. Use the other tools (look_at_screen, search_files, ...) when they \
+suffice, since they need no approval. Don't read or print secrets, .env files, or credentials. Finish with a \
+short plain-text summary of what you did.\
+"""
+)
+
+_do_agent = ClaudeCodeAgent(DO_SYSTEM_PROMPT, power=True)
+_do_running = False
+_approval = {"pending": None, "bad_codes": 0, "lockout_until": 0.0, "last_counter": 0}
+
+
+def _load_totp_secret() -> "str | None":
+    try:
+        with open(TOTP_SECRET_FILE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+async def _request_approval(context: ContextTypes.DEFAULT_TYPE, request: dict):
+    """Ask the owner to approve one command. Returns (approved, reason)."""
+    if time.time() < _approval["lockout_until"]:
+        return False, "approvals are locked after too many wrong codes"
+    if _load_totp_secret() is None:
+        return False, "power mode isn't set up (run setup_totp.py on the laptop)"
+
+    command, purpose = request["command"], request.get("purpose") or "(none given)"
+    log.info("Power mode approval requested: %s", command)
+    future = asyncio.get_running_loop().create_future()
+    _approval["pending"] = future
+    try:
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=(
+                "Claude wants to run this on your laptop:\n\n"
+                f"{command}\n\n"
+                f"Why (Claude's words, not verified): {purpose}\n\n"
+                f"Reply with your 6-digit code to approve, or 'no' to deny. "
+                f"Expires in {APPROVAL_TIMEOUT_SECONDS // 60} min."
+            ),
+        )
+        try:
+            return await asyncio.wait_for(future, APPROVAL_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="Approval timed out -- denied.")
+            return False, "timed out"
+    finally:
+        _approval["pending"] = None
+
+
+async def _handle_approval_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """While an approval is pending, the next message is the answer."""
+    future = _approval["pending"]
+    text = text.strip()
+
+    if re.fullmatch(r"(?i)(no|n|deny|cancel|stop)", text):
+        await update.message.reply_text("Denied.")
+        future.set_result((False, "denied by owner"))
+        return
+
+    if re.fullmatch(r"\d{3}\s?\d{3}", text):
+        try:
+            await update.message.delete()  # keep codes out of the chat history
+        except Exception:
+            pass
+        counter = totp.verify(_load_totp_secret() or "", text, after=_approval["last_counter"])
+        if counter is not None:
+            _approval["last_counter"] = counter
+            _approval["bad_codes"] = 0
+            await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="Approved.")
+            future.set_result((True, "approved"))
+            return
+        _approval["bad_codes"] += 1
+        if _approval["bad_codes"] >= APPROVAL_MAX_BAD_CODES:
+            _approval["bad_codes"] = 0
+            _approval["lockout_until"] = time.time() + APPROVAL_LOCKOUT_SECONDS
+            log.warning("Power mode locked out after repeated wrong codes")
+            await context.bot.send_message(
+                chat_id=ALLOWED_CHAT_ID,
+                text=f"Too many wrong codes. Approvals are locked for {APPROVAL_LOCKOUT_SECONDS // 60} minutes.",
+            )
+            future.set_result((False, "too many wrong codes"))
+            return
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text=f"Wrong code ({_approval['bad_codes']}/{APPROVAL_MAX_BAD_CODES}). Try again, or reply 'no'.",
+        )
+        return
+
+    await update.message.reply_text("Waiting for your 6-digit code to approve, or 'no' to deny.")
+
+
+async def _handle_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str):
+    global _do_running
+
+    if _do_running:
+        await update.message.reply_text("A 'do' task is already running. Wait for it to finish.")
+        return
+    if _load_totp_secret() is None:
+        await update.message.reply_text(
+            "Power mode isn't set up yet. On the laptop, run `python setup_totp.py` and scan the QR code "
+            "with an authenticator app."
+        )
+        return
+    reason = await asyncio.to_thread(_do_agent.unavailable_reason)
+    if reason:
+        await update.message.reply_text(f"Power mode needs Claude Code: {reason}")
+        return
+
+    _do_running = True
+    # Run as its own task: the owner's approval replies arrive as new updates,
+    # which can't be handled while this handler is still waiting on the task.
+    context.application.create_task(_run_do(update, context, task))
+    await update.message.reply_text(
+        "On it. I'll message you for each command I need to run -- reply with your code to approve."
+    )
+
+
+async def _run_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str):
+    global _do_running
+
+    async def keep_typing():
+        while True:
+            try:
+                await update.message.chat.send_action("typing")
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+
+    loop = asyncio.get_running_loop()
+
+    def approval(request):
+        future = asyncio.run_coroutine_threadsafe(_request_approval(context, request), loop)
+        return future.result(timeout=APPROVAL_TIMEOUT_SECONDS + 30)
+
+    typing_task = asyncio.create_task(keep_typing())
+    try:
+        reply, outbox = await asyncio.to_thread(_do_agent.run, task, approval)
+        await _deliver_agent_output(update, reply, outbox)
+    except Exception as e:
+        log.exception("Power-mode task failed")
+        await update.message.reply_text(f"Task failed: {str(e)[:300]}")
+    finally:
+        typing_task.cancel()
+        _do_running = False
 
 
 async def _handle_get_file(update: Update, filename: str):
@@ -2142,6 +2316,11 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     ask_match = re.match(r"(?i)^ask\s+(.+)$", raw_text)
     if ask_match:
         await _handle_agent(update, ask_match.group(1))
+        return
+
+    do_match = re.match(r"(?i)^do\s+(.+)$", raw_text)
+    if do_match:
+        await _handle_do(update, context, do_match.group(1))
         return
 
     get_match = re.match(r"(?i)^get\s+(.+)$", raw_text)
@@ -2275,6 +2454,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
         return
 
+    if _approval["pending"] is not None:
+        await _handle_approval_reply(update, context, update.message.text or "")
+        return
+
     await _execute_text_command(update, context, update.message.text or "")
 
 
@@ -2304,6 +2487,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not ALLOWED_CHAT_ID or chat_id != ALLOWED_CHAT_ID:
         log.warning("Ignored voice message from unauthorized chat_id=%s", chat_id)
+        return
+
+    if _approval["pending"] is not None:
+        await update.message.reply_text("An approval is waiting: type your 6-digit code (or 'no'). Voice isn't accepted for this.")
         return
 
     voice = update.message.voice

@@ -27,6 +27,9 @@ log = logging.getLogger("telegram-remote.claude-code")
 
 DEFAULT_MODEL = "sonnet"
 TIMEOUT_SECONDS = 180
+# Power-mode ("do") tasks run several steps and wait on human approvals; time
+# spent waiting for an approval doesn't count against this.
+POWER_TIMEOUT_SECONDS = 1800
 LOGIN_CACHE_SECONDS = 60
 MCP_SERVER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
 
@@ -59,8 +62,46 @@ def find_claude_code() -> "str | None":
     return max(candidates, key=version_key) if candidates else None
 
 
+def _kill_tree(proc):
+    """claude.exe spawns the tool server, which spawns PowerShell; killing
+    only the parent would orphan them."""
+    subprocess.run(
+        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def _serve_approvals(outbox: str, approval, handled: set) -> float:
+    """Hand each new approval request the tool server filed to `approval`
+    (blocking) and write back its answer. Returns seconds spent waiting."""
+    waited = 0.0
+    for path in sorted(glob.glob(os.path.join(outbox, "approval_*.req.json"))):
+        if path in handled:
+            continue
+        handled.add(path)
+        try:
+            with open(path, encoding="utf-8") as f:
+                request = json.load(f)
+        except (OSError, ValueError):
+            continue
+        started = time.time()
+        try:
+            approved, reason = approval(request)
+        except Exception as e:
+            log.exception("Approval handler failed")
+            approved, reason = False, f"approval failed: {e}"
+        response_path = path.replace(".req.json", ".resp.json")
+        with open(response_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"approved": bool(approved), "reason": reason}, f)
+        os.replace(response_path + ".tmp", response_path)
+        waited += time.time() - started
+    return waited
+
+
 class ClaudeCodeAgent:
-    def __init__(self, system_prompt: str):
+    def __init__(self, system_prompt: str, power: bool = False):
+        self._power = power
         self._system = system_prompt
         self._history: list[tuple[str, str]] = []
         self._last_activity = 0.0
@@ -103,9 +144,12 @@ class ClaudeCodeAgent:
     def reset(self):
         self._history.clear()
 
-    def run(self, user_text: str) -> "tuple[str, list]":
+    def run(self, user_text: str, approval=None) -> "tuple[str, list]":
         """Blocking -- call from a worker thread. Returns (reply, outbox
-        items); items are photos/files to send plus guard requests."""
+        items); items are photos/files to send plus guard requests.
+
+        `approval(request) -> (approved, reason)` is called (blocking) for
+        each command a power-mode task wants to run."""
         now = time.time()
         if now - self._last_activity > HISTORY_TTL_SECONDS:
             self._history.clear()
@@ -131,7 +175,10 @@ class ClaudeCodeAgent:
                             "axiom": {
                                 "command": os.path.join(os.path.dirname(sys.executable), "python.exe"),
                                 "args": [MCP_SERVER_SCRIPT],
-                                "env": {"AXIOM_OUTBOX_DIR": outbox},
+                                "env": {
+                                    "AXIOM_OUTBOX_DIR": outbox,
+                                    **({"AXIOM_POWER_MODE": "1"} if self._power else {}),
+                                },
                             }
                         }
                     },
@@ -160,36 +207,54 @@ class ClaudeCodeAgent:
             # An API key in the environment would silently switch Claude Code
             # from the subscription to pay-per-use billing.
             env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+            timeout = POWER_TIMEOUT_SECONDS if self._power else TIMEOUT_SECONDS
+            if self._power:
+                # Claude Code gives up on a slow MCP tool call; a tool that waits on
+                # a human approval is slow by design.
+                env["MCP_TOOL_TIMEOUT"] = str(timeout * 1000)
             work_dir = os.path.join(tempfile.gettempdir(), "axiom_ask_cwd")
             os.makedirs(work_dir, exist_ok=True)
 
-            log.info("Claude Code ask: %s", user_text)
+            log.info("Claude Code %s: %s", "do" if self._power else "ask", user_text)
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=work_dir,
+                env=env,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            deadline = time.time() + timeout
+            send_input, handled = prompt, set()
             try:
-                proc = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    cwd=work_dir,
-                    env=env,
-                    timeout=TIMEOUT_SECONDS,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(f"Claude Code took longer than {TIMEOUT_SECONDS}s and was stopped.")
+                while True:
+                    try:
+                        stdout, stderr = proc.communicate(input=send_input, timeout=0.5)
+                        break
+                    except subprocess.TimeoutExpired:
+                        send_input = None
+                    if approval is not None:
+                        deadline += _serve_approvals(outbox, approval, handled)
+                    if time.time() > deadline:
+                        raise RuntimeError(f"Claude Code took longer than {timeout}s and was stopped.")
+            finally:
+                if proc.poll() is None:
+                    _kill_tree(proc)
 
             result = None
             try:
-                parsed = json.loads(proc.stdout)
+                parsed = json.loads(stdout)
                 if isinstance(parsed, list):
                     parsed = next((e for e in reversed(parsed) if e.get("type") == "result"), None)
                 result = parsed
             except ValueError:
                 pass
             if not isinstance(result, dict):
-                raise RuntimeError((proc.stderr or proc.stdout or "no output").strip()[:300])
+                raise RuntimeError((stderr or stdout or "no output").strip()[:300])
             if result.get("is_error"):
                 raise RuntimeError(str(result.get("result") or "Claude Code reported an error")[:300])
 

@@ -104,6 +104,9 @@ any chat ID other than the one in `.env` are silently ignored.
 - `listen` — records ~6 seconds from the microphone and sends it back
   as an audio clip
 
+- `do <task>` — power mode: Claude can run PowerShell on the laptop, but
+  only commands you approve one by one with an authenticator code, see
+  [Power mode](#power-mode)
 - `guard on` / `guard off` / `guard status` — bodyguard mode, see
   [Guard mode](#guard-mode)
 - `ask <anything>` — plain-English requests, see [Ask mode](#ask-mode).
@@ -168,6 +171,50 @@ request is a small Claude API call billed to your Anthropic account;
 screenshots add roughly a thousand tokens. Server-side refusal fallbacks
 are turned on, and the bot silently continues without them if the API
 rejects that option.
+
+## Power mode
+
+`do <task>` ("do install Discord", "do find the biggest folders in my
+Downloads and tell me") is ask mode plus one extra tool, `run_powershell`,
+which can do nearly anything you could do at the laptop. Ask mode stays
+fenced to its 15 tools and never needs a code; `do` is the only way to
+reach the shell.
+
+**Every command needs you.** Before anything runs, the bot messages you the
+exact command (plus Claude's one-line reason, which isn't verified) and
+waits. Reply with the current 6-digit code from your authenticator app to
+approve that one command, or `no` to deny. Each approval covers a single
+command, so anything that tricks the model mid-task (a booby-trapped file,
+text on screen) still has to get past you. Codes are one-time (a used code
+can't be replayed), the message carrying your code is deleted from the chat,
+three wrong codes deny the action and lock approvals for 15 minutes, and
+unanswered requests expire after 5 minutes. Voice replies aren't accepted.
+
+**Setup, once, on the laptop:** `python setup_totp.py`. It opens a QR code
+on the laptop's own screen for you to scan with Google/Microsoft
+Authenticator (or type the key in), and only saves the secret
+(`totp_secret.txt`, gitignored) after you prove a matching code. The secret
+is deliberately never sent through Telegram: its history would hand it to
+anyone who got into your account.
+
+**Limits, stated plainly:**
+- Commands run as you, **not elevated**. Per-user installs (e.g.
+  `winget install Discord.Discord`) can work; anything needing admin can't,
+  since a permission prompt has no one to click it.
+- The gate is you reading the command. A command is capped at 1500
+  characters so it's readable on a phone; an approved command can still be
+  something you misjudged.
+- A string tripwire refuses any command mentioning `.env`, the TOTP secret,
+  Claude/credential files, face data, `bot.log` or the bot's tokens, even
+  with a valid code. That's a tripwire, not a wall: an obfuscated command
+  could dodge string matching, which is why the commands also run with the
+  bot's secrets stripped from their environment.
+- Output returned to Claude is clipped to 15,000 characters, and a command
+  is killed after its timeout (default 60s, max 600s).
+- Multi-step tasks use much more of your Claude plan's usage allowance than
+  a quick `ask`.
+- Only one `do` task runs at a time, and it needs the Claude Code backend
+  (not the API key fallback).
 
 ## Guard mode
 
