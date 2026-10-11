@@ -121,9 +121,35 @@ send the sentence -- anything that isn't a known command is routed
 here, and so are voice messages. If `get <something>` finds no matching
 file, the request also falls through to ask mode.
 
-Setup: add `ANTHROPIC_API_KEY=<key>` to `.env` (and optionally
-`CLAUDE_MODEL`, default `claude-opus-5-5`), `pip install anthropic`, and
-restart the bot. Without a key the bot behaves exactly as before.
+Two backends, same toolbox and same fence:
+
+- **Claude Code (preferred, uses your Claude subscription -- no API
+  billing).** Sign the Claude Code program in once with
+  `claude auth login --claudeai` (the program is bundled inside the
+  Claude desktop app; see below for where it lives). Each request runs
+  `claude -p` with every built-in tool switched off (`--tools ""`), only
+  the tool server in `mcp_server.py` loaded (`--strict-mcp-config`), only
+  that server's tools pre-approved, and everything else denied
+  (`--permission-mode dontAsk --permission-prompts none`), settings files
+  and skills ignored, model `sonnet` (override with `CLAUDE_CODE_MODEL`).
+  `ANTHROPIC_API_KEY` is stripped from its environment on purpose, since
+  a key would silently switch it to pay-per-use billing. It counts
+  against your plan's usage limits, and a reply takes a few seconds
+  longer than the API because a program starts per request.
+- **API key (fallback).** Add `ANTHROPIC_API_KEY=<key>` to `.env` (and
+  optionally `CLAUDE_MODEL`, default `claude-opus-5-5`),
+  `pip install anthropic`, restart. Pay-per-use.
+
+`ASK_BACKEND=api` or `claude-code` in `.env` forces one. With neither
+set up the bot behaves exactly as before.
+
+The Claude desktop app is a packaged Store app, so its bundled
+`claude.exe` only shows up at `%APPDATA%\Claude\claude-code\...` for
+processes the app launches. Everything else (the bot, a normal terminal)
+finds it at `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\
+claude-code\<version>\<hash>\claude.exe`. The bot searches both and picks
+the newest version, so app updates don't break it; set `CLAUDE_CODE_EXE`
+to pin a path.
 
 Claude only acts through a fixed toolbox in `bot.py` (`_build_agent_tools`):
 see the screen, send a screenshot / webcam photo, system stats, search

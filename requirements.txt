@@ -12,3 +12,4 @@ winsdk
 pypdf
 sounddevice
 anthropic
+mcp

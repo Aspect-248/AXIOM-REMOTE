@@ -25,6 +25,7 @@ from datetime import datetime, timedelta
 
 import psutil
 from agent import Agent, Tool
+from claude_code_agent import ClaudeCodeAgent
 from dotenv import load_dotenv
 from telegram import InputMediaPhoto, Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -190,7 +191,8 @@ def _capture_webcam_frame_unlocked():
     camera handle no matter how stuck the driver is."""
     import cv2
 
-    out_path = os.path.join(tempfile.gettempdir(), "axiom_webcam_capture.jpg")
+    # Per-process name: the ask-mode tool server captures from its own process.
+    out_path = os.path.join(tempfile.gettempdir(), f"axiom_webcam_capture_{os.getpid()}.jpg")
     if os.path.exists(out_path):
         os.remove(out_path)
 
@@ -212,6 +214,10 @@ def _capture_webcam_frame_unlocked():
         raise RuntimeError(f"Webcam capture failed: {stderr or 'unknown error'}")
 
     frame = cv2.imread(out_path)
+    try:
+        os.remove(out_path)  # don't leave face captures lying in temp
+    except OSError:
+        pass
     if frame is None:
         raise RuntimeError("Webcam capture produced an unreadable image.")
     return frame
@@ -1682,8 +1688,9 @@ def _resolve_command(text: str):
 # tool that could turn that text into one of the excluded actions.
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 AGENT_SETUP_HINT = (
-    "Ask mode isn't set up. Add ANTHROPIC_API_KEY=<your key> to .env and restart "
-    "the bot (and `pip install anthropic` if it's missing)."
+    "Ask mode isn't set up. Sign Claude Code in with your subscription "
+    "(`claude auth login --claudeai`), or add ANTHROPIC_API_KEY=<key> to .env "
+    "and restart the bot."
 )
 AGENT_READ_CHAR_LIMIT = 20000
 AGENT_MAX_FILES_SCANNED = 50000
@@ -1969,35 +1976,67 @@ def _build_agent_tools() -> list[Tool]:
 
 
 _agent = Agent(AGENT_SYSTEM_PROMPT, _build_agent_tools())
+_claude_code = ClaudeCodeAgent(AGENT_SYSTEM_PROMPT)
+
+
+def _ask_backend() -> "str | None":
+    """Claude Code (your subscription, fenced to the same toolbox over MCP)
+    is preferred; the API key route is the fallback. ASK_BACKEND=api or
+    claude-code forces one. May run `claude auth status`, so call off the
+    event loop."""
+    preference = (os.environ.get("ASK_BACKEND") or "").lower()
+    if preference != "api" and _claude_code.available():
+        return "claude-code"
+    if preference != "claude-code" and _agent.available():
+        return "api"
+    return None
+
+
+def _discard_temp_outputs(items):
+    for item in items:
+        if item.get("temp"):
+            try:
+                os.remove(item.get("photo") or item["document"])
+            except (OSError, KeyError):
+                pass
 
 
 async def _handle_agent(update: Update, text: str):
-    if not _agent.available():
-        await update.message.reply_text(AGENT_SETUP_HINT)
+    backend = await asyncio.to_thread(_ask_backend)
+    if backend is None:
+        reason = _claude_code.unavailable_reason()
+        await update.message.reply_text(f"{AGENT_SETUP_HINT}\n({reason})" if reason else AGENT_SETUP_HINT)
         return
 
-    log.info("Agent request: %s", text)
+    log.info("Agent request (%s): %s", backend, text)
     await update.message.chat.send_action("typing")
     _agent_outbox.clear()
     try:
-        reply = await asyncio.to_thread(_agent.run, text)
+        if backend == "claude-code":
+            reply, outbox = await asyncio.to_thread(_claude_code.run, text)
+        else:
+            reply = await asyncio.to_thread(_agent.run, text)
+            outbox = list(_agent_outbox)
     except Exception as e:
         log.exception("Agent request failed")
-        for item in _agent_outbox:
-            if item.get("temp"):
-                try:
-                    os.remove(item.get("photo") or item["document"])
-                except OSError:
-                    pass
+        _discard_temp_outputs(_agent_outbox)
         _agent_outbox.clear()
         await update.message.reply_text(f"Ask failed: {str(e)[:300]}")
         return
-
-    outbox = list(_agent_outbox)
     _agent_outbox.clear()
 
-    if reply or not outbox:
+    # Guard changes come back as requests: the tool server runs in another
+    # process and can't touch this process's guard state.
+    notes = []
+    for item in [i for i in outbox if "action" in i]:
+        if item["action"] == "guard":
+            notes.append(guard_on() if item.get("enabled") else guard_off())
+    outbox = [i for i in outbox if "action" not in i]
+
+    if reply or not (outbox or notes):
         await update.message.reply_text((reply or "Done.")[:4000])
+    for note in notes:
+        await update.message.reply_text(note)
     for item in outbox:
         try:
             if "photo" in item:
@@ -2027,7 +2066,7 @@ async def _handle_get_file(update: Update, filename: str):
         path = find_file(filename)
         if path is None:
             # "get me the lab report" is natural language, not a filename.
-            if _agent.available():
+            if await asyncio.to_thread(_ask_backend):
                 await _handle_agent(update, f"get {filename}")
                 return
             folders = ", ".join(os.path.basename(f) for f in SEARCH_FOLDERS)
@@ -2171,13 +2210,13 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     handler = COMMANDS.get(canonical) if canonical else None
 
     if handler is None:
-        if _agent.available():
+        if await asyncio.to_thread(_ask_backend):
             await _handle_agent(update, raw_text)
             return
         available = ", ".join(sorted(COMMANDS))
         await update.message.reply_text(
             f"Unknown command. Available: {available}\n"
-            "(Free-text requests need ANTHROPIC_API_KEY in .env.)"
+            "(Free-text requests need ask mode set up: sign Claude Code in, or add an API key.)"
         )
         return
 
