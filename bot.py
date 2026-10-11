@@ -40,6 +40,9 @@ logging.basicConfig(
     filename=os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log"),
 )
 log = logging.getLogger("telegram-remote")
+# At INFO these log every Telegram API URL, which embeds the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # The bot runs windowless via pythonw.exe. Launching a console-subsystem
 # program from it (cmd, git, powershell, shutdown -- anything without
@@ -1197,8 +1200,20 @@ GUARD_PRESENCE_RECHECK_SECONDS = 60
 # comfortably above GUARD_TICK_SECONDS or brief touches slip between ticks.
 GUARD_TOUCH_IDLE_SECONDS = 8
 GUARD_TOUCH_COOLDOWN_SECONDS = 45
+# LockWorkStation takes a moment to register; don't call it "unlocked" in that gap.
+GUARD_LOCK_SETTLE_SECONDS = 10
+# A hood, glare or bad angle shouldn't lock you out on one frame: when the
+# first look doesn't show a known face, look again this many more times.
+GUARD_CONFIRM_SCANS = 2
+GUARD_RESCAN_DELAY_SECONDS = 2
 
-_guard = {"armed": False, "locked": False, "next_presence_check": 0.0, "last_touch_scan": 0.0}
+_guard = {
+    "armed": False,
+    "locked": False,
+    "locked_at": 0.0,
+    "next_presence_check": 0.0,
+    "last_touch_scan": 0.0,
+}
 
 
 def _load_guard_armed() -> bool:
@@ -1217,9 +1232,110 @@ def _save_guard_armed(armed: bool):
         log.exception("Couldn't persist guard state")
 
 
+_WM_WTSSESSION_CHANGE = 0x02B1
+_WTS_SESSION_LOCK = 0x7
+_WTS_SESSION_UNLOCK = 0x8
+_HWND_MESSAGE = -3
+
+# locked: None until the first lock/unlock event arrives; hwnd/registered
+# let tests and logs confirm the listener actually came up.
+_session_state = {"locked": None, "hwnd": None, "registered": False}
+
+
+def _session_watcher():
+    """Listen for Windows' own lock/unlock notifications on a hidden
+    message-only window. Polling can't do this reliably: right after a
+    lock the lock-screen splash is still on the normal desktop, so
+    "can I open the input desktop?" says "unlocked" until a key is
+    pressed and the password box appears."""
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        wtsapi32 = ctypes.windll.wtsapi32
+
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(
+            LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+        )
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HANDLE),
+                ("hIcon", wintypes.HANDLE),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HANDLE),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = LRESULT
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HANDLE, wintypes.HANDLE, wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.restype = LRESULT
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HANDLE
+        wtsapi32.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+        wtsapi32.WTSRegisterSessionNotification.restype = wintypes.BOOL
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            if msg == _WM_WTSSESSION_CHANGE:
+                if wparam == _WTS_SESSION_LOCK:
+                    _session_state["locked"] = True
+                    log.info("Session event: locked")
+                elif wparam == _WTS_SESSION_UNLOCK:
+                    _session_state["locked"] = False
+                    log.info("Session event: unlocked")
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        callback = WNDPROC(wndproc)  # must stay referenced for the thread's lifetime
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = callback
+        wc.hInstance = kernel32.GetModuleHandleW(None)
+        wc.lpszClassName = "AxiomSessionWatcher"
+        if not user32.RegisterClassW(ctypes.byref(wc)):
+            raise ctypes.WinError()
+        hwnd = user32.CreateWindowExW(
+            0, wc.lpszClassName, "AxiomSessionWatcher", 0, 0, 0, 0, 0,
+            _HWND_MESSAGE, None, wc.hInstance, None,
+        )
+        if not hwnd:
+            raise ctypes.WinError()
+        _session_state["hwnd"] = hwnd
+        # 0 = NOTIFY_FOR_THIS_SESSION
+        _session_state["registered"] = bool(wtsapi32.WTSRegisterSessionNotification(hwnd, 0))
+        log.info("Session watcher up (registered=%s)", _session_state["registered"])
+
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except Exception:
+        log.exception("Session watcher died; falling back to polling for lock state")
+        _session_state["registered"] = False
+
+
 def _is_session_locked() -> bool:
-    """When the workstation is locked the input desktop belongs to
-    Winlogon and a normal process can't open it."""
+    if _session_state["registered"] and _session_state["locked"] is not None:
+        return _session_state["locked"]
+    # Before the first event (e.g. bot started while already locked), or if
+    # the watcher failed: the input desktop belongs to Winlogon once the
+    # password box is up, and a normal process can't open it.
     user32 = ctypes.windll.user32
     user32.OpenInputDesktop.restype = ctypes.c_void_p
     desktop = user32.OpenInputDesktop(0, False, 0x0100)  # DESKTOP_SWITCHDESKTOP
@@ -1301,6 +1417,22 @@ async def _guard_handle_touch(context):
         )
 
 
+async def _guard_scan_confirmed():
+    """Returns (status, photo_path). Stops at the first "known" look."""
+    status, photo = "error", None
+    for attempt in range(1 + GUARD_CONFIRM_SCANS):
+        if attempt:
+            await asyncio.sleep(GUARD_RESCAN_DELAY_SECONDS)
+        try:
+            status, photo, _ = await asyncio.to_thread(_scan_webcam_sync)
+        except Exception:
+            log.exception("Guard presence scan failed")
+            status, photo = "error", None
+        if status == "known":
+            break
+    return status, photo
+
+
 async def _guard_tick(context):
     now = time.time()
     idle = get_idle_seconds()
@@ -1309,10 +1441,15 @@ async def _guard_tick(context):
     if locked_now and not _guard["locked"]:
         log.info("Guard: session locked externally, now watching for touches")
         _guard["locked"] = True
-        _guard["last_touch_scan"] = now
+        _guard["locked_at"] = now
+        # A lock you just did yourself (Win+L) ends with your own keypress,
+        # which isn't a "touch". A lock from while you were away has no such input.
+        _guard["last_touch_scan"] = now if idle < GUARD_TOUCH_IDLE_SECONDS else 0.0
 
     if _guard["locked"]:
         if not locked_now:
+            if now - _guard["locked_at"] < GUARD_LOCK_SETTLE_SECONDS:
+                return
             _guard["locked"] = False
             _guard["next_presence_check"] = now + GUARD_PRESENCE_RECHECK_SECONDS
             await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text="Guard: laptop unlocked.")
@@ -1328,11 +1465,7 @@ async def _guard_tick(context):
         return
     _guard["next_presence_check"] = now + GUARD_PRESENCE_RECHECK_SECONDS
 
-    try:
-        status, photo, _ = await asyncio.to_thread(_scan_webcam_sync)
-    except Exception:
-        log.exception("Guard presence scan failed")
-        status, photo = "error", None
+    status, photo = await _guard_scan_confirmed()
 
     if status == "known":
         return
@@ -1340,10 +1473,14 @@ async def _guard_tick(context):
     # may simply be busy in a video call.
     if status == "error" and idle < 2 * GUARD_IDLE_SECONDS:
         return
+    # You may have started typing during the rescans.
+    if get_idle_seconds() < GUARD_TOUCH_IDLE_SECONDS:
+        return
 
     lock_pc()
     _guard["locked"] = True
-    _guard["last_touch_scan"] = now
+    _guard["locked_at"] = time.time()
+    _guard["last_touch_scan"] = 0.0
     minutes = idle / 60
     if status == "stranger":
         await _guard_send_photo(
@@ -2508,6 +2645,7 @@ def main():
         raise SystemExit("TELEGRAM_ALLOWED_CHAT_ID is not set (see .env.example)")
 
     _guard["armed"] = _load_guard_armed()
+    threading.Thread(target=_session_watcher, daemon=True, name="session-watcher").start()
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

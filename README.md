@@ -150,13 +150,21 @@ rejects that option.
 1. After 2 minutes with no keyboard/mouse input, the bot looks through
    the webcam. If a registered face is in view you're just reading and
    nothing happens (it re-checks every minute while you stay idle).
-2. If nobody is there, or a stranger is, it locks the laptop and tells
-   you.
+2. If nobody is there, or a stranger is, it looks again twice (2s apart,
+   so a hood, glare or bad angle on one frame doesn't lock you out of
+   your own laptop). Only if none of the looks recognize you -- and you
+   haven't touched the keyboard meanwhile -- does it lock the laptop and
+   tell you.
 3. While locked, any keyboard/mouse activity triggers a webcam check:
    a stranger or a faceless touch sends you a photo straight away; a
    recognized face just gets a "recognized" note.
 4. A lock you did yourself (Win+L, `lock`) is picked up and watched the
    same way. It tells you when the laptop is unlocked again.
+
+Lock/unlock state comes from Windows' own session notifications (a
+hidden listener window in `bot.py`), not polling: right after a lock the
+lock-screen splash is still on the normal desktop, so polling wrongly
+reported "unlocked" and sent a false "laptop unlocked" message.
 
 Armed state survives bot restarts (`guard_state.json`, gitignored). If
 the webcam can't be read (busy in a video call, say), it only locks
