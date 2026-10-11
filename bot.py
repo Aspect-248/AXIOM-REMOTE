@@ -2084,8 +2084,11 @@ owner in Telegram and runs only after they approve it with a one-time code, one 
 prefer a few small, readable commands over one big script, never obfuscate or chain unrelated actions, and \
 give an honest one-line purpose for each. If a command is denied or times out, stop and report instead of \
 retrying or trying a sneakier route. Use the other tools (look_at_screen, search_files, ...) when they \
-suffice, since they need no approval. Don't read or print secrets, .env files, or credentials. Finish with a \
-short plain-text summary of what you did.\
+suffice, since they need no approval. Don't read or print secrets, .env files, or credentials.
+
+Keep every reply to one or two short sentences. If the owner denies a command, say in one short sentence what \
+you didn't do because they denied it, and stop: no alternatives, and no talk about your own tools or \
+limitations unless asked. After finishing, give a one-sentence summary of what you did.\
 """
 )
 
@@ -2116,13 +2119,7 @@ async def _request_approval(context: ContextTypes.DEFAULT_TYPE, request: dict):
     try:
         await context.bot.send_message(
             chat_id=ALLOWED_CHAT_ID,
-            text=(
-                "Claude wants to run this on your laptop:\n\n"
-                f"{command}\n\n"
-                f"Why (Claude's words, not verified): {purpose}\n\n"
-                f"Reply with your 6-digit code to approve, or 'no' to deny. "
-                f"Expires in {APPROVAL_TIMEOUT_SECONDS // 60} min."
-            ),
+            text=f"Run this?\n\n{command}\n\n({purpose})\n\nReply with your code to approve, or 'no'.",
         )
         try:
             return await asyncio.wait_for(future, APPROVAL_TIMEOUT_SECONDS)
@@ -2172,7 +2169,7 @@ async def _handle_approval_reply(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    await update.message.reply_text("Waiting for your 6-digit code to approve, or 'no' to deny.")
+    await update.message.reply_text("Waiting for your code, or 'no' to deny.")
 
 
 async def _handle_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str):
@@ -2196,9 +2193,7 @@ async def _handle_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: s
     # Run as its own task: the owner's approval replies arrive as new updates,
     # which can't be handled while this handler is still waiting on the task.
     context.application.create_task(_run_do(update, context, task))
-    await update.message.reply_text(
-        "On it. I'll message you for each command I need to run -- reply with your code to approve."
-    )
+    await update.message.reply_text("On it.")
 
 
 async def _run_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str):
@@ -2313,12 +2308,13 @@ async def _execute_text_command(update: Update, context: ContextTypes.DEFAULT_TY
     message path and the voice-transcription path."""
     raw_text = raw_text.strip()
 
-    ask_match = re.match(r"(?i)^ask\s+(.+)$", raw_text)
+    # Tolerates the comma/period speech-to-text likes to add ("Do, open Discord.").
+    ask_match = re.match(r"(?i)^ask\b[\s,:.\-]*(\S.*)$", raw_text)
     if ask_match:
         await _handle_agent(update, ask_match.group(1))
         return
 
-    do_match = re.match(r"(?i)^do\s+(.+)$", raw_text)
+    do_match = re.match(r"(?i)^do\b[\s,:.\-]*(\S.*)$", raw_text)
     if do_match:
         await _handle_do(update, context, do_match.group(1))
         return
@@ -2454,11 +2450,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.warning("Ignored message from unauthorized chat_id=%s", chat_id)
         return
 
+    text = update.message.text or ""
     if _approval["pending"] is not None:
-        await _handle_approval_reply(update, context, update.message.text or "")
+        await _handle_approval_reply(update, context, text)
         return
 
-    await _execute_text_command(update, context, update.message.text or "")
+    if re.fullmatch(r"\d{3}\s?\d{3}", text.strip()):
+        # A code with nothing waiting for it (sent before the command showed up,
+        # or stale). Never hand it to the AI or the command parser, and keep it
+        # out of the chat history.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=ALLOWED_CHAT_ID,
+            text="No approval is waiting for a code. Wait until the command appears, then send it.",
+        )
+        return
+
+    await _execute_text_command(update, context, text)
 
 
 # Loaded lazily on first voice message so bot startup isn't slowed down
@@ -2490,7 +2501,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if _approval["pending"] is not None:
-        await update.message.reply_text("An approval is waiting: type your 6-digit code (or 'no'). Voice isn't accepted for this.")
+        await update.message.reply_text("Type your code (or 'no') -- voice isn't accepted for approvals.")
         return
 
     voice = update.message.voice

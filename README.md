@@ -188,7 +188,14 @@ command, so anything that tricks the model mid-task (a booby-trapped file,
 text on screen) still has to get past you. Codes are one-time (a used code
 can't be replayed), the message carrying your code is deleted from the chat,
 three wrong codes deny the action and lock approvals for 15 minutes, and
-unanswered requests expire after 5 minutes. Voice replies aren't accepted.
+unanswered requests expire after 5 minutes. A code sent when nothing is
+waiting for it (e.g. before the command has appeared) is deleted from the
+chat and never reaches Claude, so wait for the command first.
+
+**Voice:** you can *start* a task by voice ("Do, open Discord"; the prefix
+tolerates the comma/period speech-to-text adds), but approvals must be
+typed -- voice replies are refused. Speech-to-text can mishear app names,
+which is one more reason the exact command is always shown.
 
 **Setup, once, on the laptop:** `python setup_totp.py`. It opens a QR code
 on the laptop's own screen for you to scan with Google/Microsoft
