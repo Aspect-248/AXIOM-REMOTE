@@ -11,3 +11,5 @@ models/known_faces/
 # Local runtime state for guard mode.
 guard_state.json
 totp_secret.txt
+usage_log.jsonl
+usage_settings.json

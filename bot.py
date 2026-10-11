@@ -1514,6 +1514,109 @@ async def check_guard(context: ContextTypes.DEFAULT_TYPE):
         log.exception("Guard tick failed")
 
 
+# --- AI usage log ---
+#
+# Every ask/do request through Claude Code is appended to usage_log.jsonl with
+# the list-price-equivalent cost and token counts Claude Code reports. A
+# subscription isn't billed per request, so the cents figure is only a yardstick
+# for how heavy a request is relative to others (the plan's own limits are
+# shown on the claude.ai usage page, which this bot can't read).
+USAGE_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_log.jsonl")
+USAGE_SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_settings.json")
+
+
+def _usage_footer_enabled() -> bool:
+    try:
+        with open(USAGE_SETTINGS_FILE) as f:
+            return bool(json.load(f).get("footer", True))
+    except (OSError, ValueError):
+        return True
+
+
+def _set_usage_footer(enabled: bool):
+    try:
+        with open(USAGE_SETTINGS_FILE, "w") as f:
+            json.dump({"footer": enabled}, f)
+    except OSError:
+        log.exception("Couldn't save usage settings")
+
+
+def _usage_note(mode: str, usage: "dict | None") -> str:
+    """Log one request's usage; returns the footer to append to the reply."""
+    if not usage:
+        return ""
+    record = {"ts": datetime.now().isoformat(timespec="seconds"), "mode": mode, **usage}
+    try:
+        with open(USAGE_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        log.exception("Couldn't write usage log")
+    log.info("AI usage (%s): %s", mode, usage)
+    if not _usage_footer_enabled():
+        return ""
+    steps = usage.get("turns", 0)
+    return f"\n\n(~{usage['cost_usd'] * 100:.1f}c usage, {steps} step{'s' if steps != 1 else ''})"
+
+
+def _read_usage_log() -> list:
+    records = []
+    try:
+        with open(USAGE_LOG_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return records
+
+
+def usage_report():
+    records = _read_usage_log()
+    footer = "on" if _usage_footer_enabled() else "off"
+    if not records:
+        return f"No AI requests logged yet. Per-reply usage footer is {footer} ('usage on' / 'usage off')."
+
+    now = datetime.now()
+    parsed = [(datetime.fromisoformat(r["ts"]), r) for r in records]
+    last_hour = [r for t, r in parsed if (now - t).total_seconds() < 3600]
+    today = [r for t, r in parsed if t.date() == now.date()]
+
+    def line(label, rs):
+        cost = sum(r["cost_usd"] for r in rs) * 100
+        tokens = sum(r["input_tokens"] + r["output_tokens"] for r in rs)
+        avg = f", avg {cost / len(rs):.1f}c" if rs else ""
+        return f"{label}: {len(rs)} request{'s' if len(rs) != 1 else ''}, ~{cost:.0f}c, {tokens:,} tokens{avg}"
+
+    by_mode = {}
+    for r in today:
+        by_mode[r["mode"]] = by_mode.get(r["mode"], 0) + 1
+    split = ", ".join(f"{n} {m}" for m, n in sorted(by_mode.items()))
+    last = records[-1]
+    return "\n".join(
+        [
+            "AI usage (Claude Code, this bot):",
+            line("Last hour", last_hour),
+            line("Today", today) + (f" ({split})" if split else ""),
+            line("Since logging began", records),
+            f"Last request: ~{last['cost_usd'] * 100:.1f}c, {last['turns']} steps, model {last.get('model') or '?'}",
+            "'c' = list-price-equivalent cents, not a charge; your plan's real limits are on the claude.ai usage page.",
+            f"Per-reply footer: {footer} ('usage on' / 'usage off').",
+        ]
+    )
+
+
+def usage_footer_on():
+    _set_usage_footer(True)
+    return "Usage footer ON: each AI reply ends with its approximate usage."
+
+
+def usage_footer_off():
+    _set_usage_footer(False)
+    return "Usage footer OFF (still logged; send 'usage' to see totals)."
+
+
 # Allowlist: only these exact phrases (case-insensitive) do anything.
 # Deliberately NOT a generic "run whatever text you send" handler --
 # this bot has real access to the machine, so the set of things it can
@@ -1547,6 +1650,9 @@ COMMANDS = {
     "guard on": guard_on,
     "guard off": guard_off,
     "guard status": guard_status,
+    "usage": usage_report,
+    "usage on": usage_footer_on,
+    "usage off": usage_footer_off,
     "status": status,
     "stats": stats,
     "play pause": media_play_pause,
@@ -2016,6 +2122,9 @@ async def _handle_agent(update: Update, text: str):
     try:
         if backend == "claude-code":
             reply, outbox = await asyncio.to_thread(_claude_code.run, text)
+            note = _usage_note("ask", _claude_code.last_usage)
+            if reply:
+                reply += note
         else:
             reply = await asyncio.to_thread(_agent.run, text)
             outbox = list(_agent_outbox)
@@ -2216,6 +2325,9 @@ async def _run_do(update: Update, context: ContextTypes.DEFAULT_TYPE, task: str)
     typing_task = asyncio.create_task(keep_typing())
     try:
         reply, outbox = await asyncio.to_thread(_do_agent.run, task, approval)
+        note = _usage_note("do", _do_agent.last_usage)
+        if reply:
+            reply += note
         await _deliver_agent_output(update, reply, outbox)
     except Exception as e:
         log.exception("Power-mode task failed")

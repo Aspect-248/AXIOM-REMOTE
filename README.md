@@ -146,6 +146,37 @@ Two backends, same toolbox and same fence:
 `ASK_BACKEND=api` or `claude-code` in `.env` forces one. With neither
 set up the bot behaves exactly as before.
 
+**Usage.** Every ask/do request is appended to `usage_log.jsonl`
+(gitignored) with the list-price-equivalent cost, tokens, steps and model
+Claude Code reports. Each AI reply ends with a footer like `(~0.5c usage,
+1 step)`; `usage off` / `usage on` toggles it, and `usage` reports the last
+hour, today and all-time. The cents are what the same tokens would cost on
+the API, not a charge: a subscription isn't billed per request, so treat
+them as a yardstick for how heavy a request is. A warm trivial request is
+about 0.5c; the first one after a pause (cold cache) about 1.7c; screenshots
+and multi-step `do` tasks cost more. Your plan's real 5-hour and weekly
+limits are on the claude.ai usage page and in the desktop app's usage card;
+this bot can't read them. These requests are separate Claude Code runs, so
+they never add to a desktop-app conversation's context window, but they do
+count toward the account's plan limits. Extra usage is off on this account,
+so hitting a limit pauses AI replies instead of billing anything.
+
+**Which model, and what it remembers.** The bot uses its own model setting
+(`sonnet` by default, currently Sonnet 5.5; override with
+`CLAUDE_CODE_MODEL` in `.env`, then restart), independent of whatever model
+or effort the desktop app is set to. Each of ask and do keeps only the last
+8 exchanges, only from messages that went to the AI, only while you've been
+active within 20 minutes, only in memory (a restart or 20 quiet minutes
+clears it). There's no long-term memory and no access to your Telegram
+history beyond that.
+
+**If the plan lapses or a limit is hit.** Everything that doesn't call
+Claude keeps working: all the exact commands (lock, screenshot, open ...,
+guard, reminders, scan network, ...) and voice transcription, which runs
+locally. Free-text, `ask`, `do` and voice requests that fall through to the
+AI fail with "Ask failed: <the message Claude Code gave>" (or, if the login
+itself is gone, the "Ask mode isn't set up" hint). Nothing is charged.
+
 The Claude desktop app is a packaged Store app, so its bundled
 `claude.exe` only shows up at `%APPDATA%\Claude\claude-code\...` for
 processes the app launches. Everything else (the bot, a normal terminal)

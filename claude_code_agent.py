@@ -102,6 +102,7 @@ def _serve_approvals(outbox: str, approval, handled: set) -> float:
 class ClaudeCodeAgent:
     def __init__(self, system_prompt: str, power: bool = False):
         self._power = power
+        self.last_usage: "dict | None" = None
         self._system = system_prompt
         self._history: list[tuple[str, str]] = []
         self._last_activity = 0.0
@@ -259,6 +260,21 @@ class ClaudeCodeAgent:
                 raise RuntimeError(str(result.get("result") or "Claude Code reported an error")[:300])
 
             reply = str(result.get("result") or "").strip()
+            usage = result.get("usage") or {}
+            cache_read = int(usage.get("cache_read_input_tokens") or 0)
+            self.last_usage = {
+                # List-price equivalent: what the same tokens would cost on the API.
+                # A subscription isn't billed per request; this just shows relative weight.
+                "cost_usd": float(result.get("total_cost_usd") or 0.0),
+                "input_tokens": int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + cache_read,
+                "cache_read_tokens": cache_read,
+                "output_tokens": int(usage.get("output_tokens") or 0),
+                "turns": int(result.get("num_turns") or 0),
+                "api_seconds": round((result.get("duration_api_ms") or 0) / 1000, 1),
+                "model": next(iter(result.get("modelUsage") or {}), ""),
+            }
             items = []
             outbox_file = os.path.join(outbox, "outbox.jsonl")
             if os.path.exists(outbox_file):
